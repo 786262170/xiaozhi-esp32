@@ -318,6 +318,28 @@ class BoardSelectionTests(unittest.TestCase):
             "CONFIG_BOARD_TYPE_ESP32_S3_BOX_3",
         )
 
+    def test_korvo2_tdm_reference_slot_maps_to_physical_mic3_gain(self):
+        board_dir = ROOT / "main/boards/espressif/esp32-s3-korvo-2-v3.0"
+        config = (board_dir / "config.h").read_text(encoding="utf-8")
+        board = (board_dir / "esp32s3_korvo2_v3_board.cc").read_text(
+            encoding="utf-8"
+        )
+        # ES7210 TDM slots are ordered MIC1, MIC3, MIC2, MIC4.  The AFE
+        # therefore consumes slot 1 as R, while codec gain masks use physical
+        # microphone numbering and must attenuate physical MIC3 (index 2).
+        self.assertRegex(
+            config, r"#define\s+AUDIO_INPUT_REFERENCE_GAIN_CHANNEL\s+2"
+        )
+        self.assertIn("AUDIO_INPUT_REFERENCE_GAIN_CHANNEL", board)
+        self.assertNotIn("AUDIO_INPUT_FORMAT", config)
+
+        afe_source = (
+            ROOT / "main/audio/engines/afe_audio_engine.cc"
+        ).read_text(encoding="utf-8")
+        microphone = afe_source.index("input_format.push_back('M')")
+        reference = afe_source.index("input_format.push_back('R')")
+        self.assertLess(microphone, reference)
+
     def test_m5stack_directory_can_omit_manufacturer_prefix(self):
         board = "m5stack/cardputer-adv"
         self.assertTrue(build._board_type_exists(board))
