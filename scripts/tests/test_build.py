@@ -340,6 +340,19 @@ class BoardSelectionTests(unittest.TestCase):
         reference = afe_source.index("input_format.push_back('R')")
         self.assertLess(microphone, reference)
 
+    def test_webrtc_initializes_media_adapter_before_audio_codecs(self):
+        source = (ROOT / "main/application.cc").read_text(encoding="utf-8")
+        initialize = source[
+            source.index("void Application::Initialize()") :
+            source.index("void Application::Run()")
+        ]
+
+        self.assertIn("livekit_system_init()", initialize)
+        self.assertLess(
+            initialize.index("livekit_system_init()"),
+            initialize.index("audio_service_.Initialize(codec)"),
+        )
+
     def test_m5stack_directory_can_omit_manufacturer_prefix(self):
         board = "m5stack/cardputer-adv"
         self.assertTrue(build._board_type_exists(board))

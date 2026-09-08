@@ -12,6 +12,7 @@
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
 #if CONFIG_USE_WEBRTC
+#include <livekit.h>
 #include "webrtc_protocol.h"
 #endif
 
@@ -63,6 +64,16 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+
+#if CONFIG_USE_WEBRTC
+    // Linking LiveKit makes esp_audio_codec allocations use media_lib's SAL.
+    // Register its memory and OS adapters before AudioService opens Opus.
+    auto livekit_result = livekit_system_init();
+    if (livekit_result != LIVEKIT_ERR_NONE) {
+        ESP_LOGE(TAG, "Failed to initialize LiveKit media adapters: %d",
+                 static_cast<int>(livekit_result));
+    }
+#endif
 
     // Setup the display
     auto display = board.GetDisplay();
