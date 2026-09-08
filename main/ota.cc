@@ -27,6 +27,14 @@
 
 #define TAG "Ota"
 
+namespace {
+constexpr int kOtaHttpTimeoutMs = 8000;
+
+bool StartsWith(const std::string& value, const char* prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+}  // namespace
+
 Ota::Ota() {
 #ifdef ESP_EFUSE_BLOCK_USR_DATA
     // Read Serial Number from efuse user_data
@@ -40,15 +48,51 @@ Ota::Ota() {
         }
     }
 #endif
+
+    // OTA responses persist protocol settings in NVS. A regular boot may use
+    // the last known-good secure public WebSocket endpoint if refreshing OTA
+    // metadata fails. Do not revive an old ws:// LAN endpoint when the
+    // configured OTA control plane is HTTPS.
+    Settings websocket_settings("websocket", false);
+    const std::string websocket_url = websocket_settings.GetString("url");
+    const bool secure_ota = StartsWith(GetCheckVersionUrl(), "https://");
+    if (!websocket_url.empty() &&
+        (!secure_ota || StartsWith(websocket_url, "wss://"))) {
+        has_websocket_config_ = true;
+        has_cached_protocol_config_ = true;
+        ESP_LOGI(TAG, "Loaded cached secure WebSocket configuration");
+    } else if (!websocket_url.empty()) {
+        ESP_LOGW(TAG, "Ignoring insecure cached WebSocket configuration");
+    }
+
+    if (!has_cached_protocol_config_) {
+        Settings mqtt_settings("mqtt", false);
+        if (!mqtt_settings.GetString("endpoint").empty()) {
+            has_mqtt_config_ = true;
+            has_cached_protocol_config_ = true;
+            ESP_LOGI(TAG, "Loaded cached MQTT configuration");
+        }
+    }
 }
 
 Ota::~Ota() {}
 
 std::string Ota::GetCheckVersionUrl() {
-    Settings settings("wifi", false);
+    const std::string compiled_url = CONFIG_OTA_URL;
+    Settings settings("wifi", true);
     std::string url = settings.GetString("ota_url");
     if (url.empty()) {
-        url = CONFIG_OTA_URL;
+        return compiled_url;
+    }
+
+    // Product firmware compiled for an HTTPS control plane must never be
+    // redirected back to a stale LAN/http endpoint left in NVS by a debug
+    // build. Persist the correction so all later boots use the public URL.
+    if (StartsWith(CONFIG_OTA_URL, "https://") &&
+        !StartsWith(url, "https://")) {
+        ESP_LOGW(TAG, "Ignoring insecure OTA URL override: %s", url.c_str());
+        settings.SetString("ota_url", compiled_url);
+        return compiled_url;
     }
     return url;
 }
@@ -57,6 +101,7 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     auto& board = Board::GetInstance();
     auto network = board.GetNetwork();
     auto http = network->CreateHttp(0);
+    http->SetTimeout(kOtaHttpTimeoutMs);
     auto user_agent = SystemInfo::GetUserAgent();
     http->SetHeader("Activation-Version", has_serial_number_ ? "2" : "1");
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
@@ -186,6 +231,7 @@ esp_err_t Ota::CheckVersion() {
     } else {
         ESP_LOGI(TAG, "No websocket section found!");
     }
+    has_cached_protocol_config_ = has_mqtt_config_ || has_websocket_config_;
 
     has_webrtc_config_ = false;
     cJSON* webrtc = cJSON_GetObjectItem(root, "webrtc");

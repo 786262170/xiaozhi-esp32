@@ -97,6 +97,54 @@ bool Protocol::SendPhoneHangupRequest() {
     return SendText(message);
 }
 
+bool Protocol::SendPlaybackProgress(const std::string& output_id, int64_t played_ms,
+                                    int64_t buffered_ms, int64_t device_ts) {
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "session_id", session_id_.c_str());
+    cJSON_AddStringToObject(root, "type", "playback");
+    cJSON_AddStringToObject(root, "state", "progress");
+    cJSON* payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "output_id", output_id.c_str());
+    cJSON_AddNumberToObject(payload, "played_ms", static_cast<double>(played_ms));
+    cJSON_AddNumberToObject(payload, "buffered_ms", static_cast<double>(buffered_ms));
+    cJSON_AddNumberToObject(payload, "device_ts", static_cast<double>(device_ts));
+    cJSON_AddItemToObject(root, "payload", payload);
+    char* json = cJSON_PrintUnformatted(root);
+    bool sent = json != nullptr && SendText(json);
+    if (json != nullptr) {
+        cJSON_free(json);
+    }
+    cJSON_Delete(root);
+    return sent;
+}
+
+bool Protocol::SendPlaybackStopped(const std::string& output_id, int64_t played_ms,
+                                   const std::string& reason, int64_t device_ts) {
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "session_id", session_id_.c_str());
+    cJSON_AddStringToObject(root, "type", "playback");
+    cJSON_AddStringToObject(root, "state", "stopped");
+    cJSON* payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "output_id", output_id.c_str());
+    cJSON_AddNumberToObject(payload, "played_ms", static_cast<double>(played_ms));
+    cJSON_AddStringToObject(payload, "reason", reason.c_str());
+    cJSON_AddNumberToObject(payload, "device_ts", static_cast<double>(device_ts));
+    cJSON_AddItemToObject(root, "payload", payload);
+    char* json = cJSON_PrintUnformatted(root);
+    bool sent = json != nullptr && SendText(json);
+    if (json != nullptr) {
+        cJSON_free(json);
+    }
+    cJSON_Delete(root);
+    return sent;
+}
+
 void Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";

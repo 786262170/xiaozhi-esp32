@@ -16,6 +16,9 @@
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
+#if CONFIG_LOCAL_VAD_BARGE_IN
+#include "barge_in_guard.h"
+#endif
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "phone_call_controller.h"
@@ -97,9 +100,16 @@ public:
      */
     void ToggleChatState();
 
-    // Phone-style controls use an explicit lifecycle instead of the generic
-    // chat-state toggle so a physical hook transition remains idempotent.
+    /**
+     * Toggle chat state from the phone-style REC button.
+     * The server owns any connection greeting audio.
+     */
     void TogglePhoneChatState();
+
+    /**
+     * Apply the physical handset state without toggle ambiguity.
+     * off_hook=true starts an idle call; false hangs up an active call.
+     */
     void SetPhoneHookState(bool off_hook);
 
     /**
@@ -155,6 +165,8 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    std::mutex playback_protocol_mutex_;
+    std::string active_remote_output_id_;
     PhoneCallController phone_call_controller_;
     std::atomic<bool> phone_hook_off_hook_{false};
     std::atomic<bool> phone_connect_task_running_{false};
@@ -166,6 +178,19 @@ private:
     int64_t phone_call_started_us_ = 0;
     int64_t phone_last_ringback_us_ = 0;
     int64_t phone_hangup_requested_us_ = 0;
+#if CONFIG_LOCAL_VAD_BARGE_IN
+    bool local_vad_barge_in_armed_ = false;
+    bool barge_in_waiting_for_playback_drain_ = false;
+    BargeInGuard barge_in_guard_;
+#endif
+#if CONFIG_ML307_LOCAL_VAD_BARGE_IN
+    bool ml307_local_barge_in_pending_ = false;
+#endif
+#if CONFIG_VOICE_LATENCY_METRICS
+    bool device_first_audio_logged_ = false;
+    bool turn_completion_waiting_for_playback_drain_ = false;
+    uint32_t voice_metric_turn_id_ = 0;
+#endif
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

@@ -28,18 +28,73 @@
 namespace {
 constexpr int64_t kPhoneCallTimeoutUs = 8 * 1000 * 1000;
 constexpr int64_t kPhoneHangupTimeoutUs = 4 * 1000 * 1000;
+// The selected A-version intro contains a 120 ms lead-in and two ringback
+// bursts separated by 880 ms. Starting the retry at 4.9 seconds preserves
+// the same natural pause after the second burst when the server is still busy.
 constexpr int64_t kPhoneRingbackCadenceUs = 4900 * 1000;
 constexpr uint32_t kPhoneConnectTaskStackSize = 8192;
-// Keep network setup below the Opus codec task so local ringback playback is
-// not starved while the selected transport performs its handshake.
+// Keep TLS/WebSocket setup below the Opus codec task (priority 2). Otherwise
+// the connection handshake can starve local ringback decoding and make the
+// second burst stutter even though the embedded Ogg asset is continuous.
 constexpr UBaseType_t kPhoneConnectTaskPriority = 1;
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+constexpr size_t kMaxPlaybackOutputIdLength = 128;
+constexpr size_t kMaxPlaybackActionLength = 16;
+constexpr size_t kMaxPlaybackReasonLength = 64;
+#endif
+#if CONFIG_LISTENER_FEEDBACK
+constexpr size_t kMaxFeedbackClipIdLength = 64;
+#endif
 
 extern const char ogg_phone_dial_start[] asm("_binary_phone_dial_ogg_start");
 extern const char ogg_phone_dial_end[] asm("_binary_phone_dial_ogg_end");
 const std::string_view kPhoneCallingIntroSound{
     static_cast<const char*>(ogg_phone_dial_start),
     static_cast<size_t>(ogg_phone_dial_end - ogg_phone_dial_start)};
+
+#if CONFIG_LISTENER_FEEDBACK
+extern const char ogg_neutral_ack_1_start[] asm("_binary_neutral_ack_1_ogg_start");
+extern const char ogg_neutral_ack_1_end[] asm("_binary_neutral_ack_1_ogg_end");
+extern const char ogg_neutral_ack_2_start[] asm("_binary_neutral_ack_2_ogg_start");
+extern const char ogg_neutral_ack_2_end[] asm("_binary_neutral_ack_2_ogg_end");
+extern const char ogg_neutral_ack_3_start[] asm("_binary_neutral_ack_3_ogg_start");
+extern const char ogg_neutral_ack_3_end[] asm("_binary_neutral_ack_3_ogg_end");
+
+const std::string_view kNeutralAck1{
+    static_cast<const char*>(ogg_neutral_ack_1_start),
+    static_cast<size_t>(ogg_neutral_ack_1_end - ogg_neutral_ack_1_start)};
+const std::string_view kNeutralAck2{
+    static_cast<const char*>(ogg_neutral_ack_2_start),
+    static_cast<size_t>(ogg_neutral_ack_2_end - ogg_neutral_ack_2_start)};
+const std::string_view kNeutralAck3{
+    static_cast<const char*>(ogg_neutral_ack_3_start),
+    static_cast<size_t>(ogg_neutral_ack_3_end - ogg_neutral_ack_3_start)};
+
+std::string_view ListenerFeedbackSound(const char* clip_id) {
+    if (clip_id == nullptr) {
+        return {};
+    }
+    if (strcmp(clip_id, "neutral_ack_1") == 0) {
+        return kNeutralAck1;
+    }
+    if (strcmp(clip_id, "neutral_ack_2") == 0) {
+        return kNeutralAck2;
+    }
+    if (strcmp(clip_id, "neutral_ack_3") == 0) {
+        return kNeutralAck3;
+    }
+    return {};
+}
+#endif
 }  // namespace
+
+#if CONFIG_VOICE_LATENCY_METRICS
+static void LogVoiceMetric(const char* event, uint32_t turn_id) {
+    ESP_LOGI(TAG, "VOICE_METRIC event=%s turn_id=%lu ts_mono_ms=%lld", event,
+             static_cast<unsigned long>(turn_id),
+             static_cast<long long>(esp_timer_get_time() / 1000));
+}
+#endif
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -115,6 +170,26 @@ void Application::Initialize() {
     callbacks.on_playback_drained = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     };
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+    callbacks.on_playback_progress =
+        [this](const std::string& output_id, int64_t played_ms, int64_t buffered_ms,
+               int64_t device_ts) {
+            Schedule([this, output_id, played_ms, buffered_ms, device_ts]() {
+                if (protocol_) {
+                    protocol_->SendPlaybackProgress(output_id, played_ms, buffered_ms, device_ts);
+                }
+            });
+        };
+    callbacks.on_playback_stopped =
+        [this](const std::string& output_id, int64_t played_ms, const std::string& reason,
+               int64_t device_ts) {
+            Schedule([this, output_id, played_ms, reason, device_ts]() {
+                if (protocol_) {
+                    protocol_->SendPlaybackStopped(output_id, played_ms, reason, device_ts);
+                }
+            });
+        };
+#endif
     audio_service_.SetCallbacks(callbacks);
 
     // Add state change listeners
@@ -244,6 +319,9 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+            audio_service_.CompleteRemotePlaybackIfDrained();
+#endif
             if (phone_call_controller_.state() == PhoneCallState::kHangingUp &&
                 audio_service_.IsPlaybackIdle()) {
                 if (phone_hangup_sound_playing_.load()) {
@@ -252,6 +330,18 @@ void Application::Run() {
                     CompletePhoneHangup("farewell playback drained");
                 }
             }
+#if CONFIG_LOCAL_VAD_BARGE_IN && CONFIG_VOICE_LATENCY_METRICS
+            if (barge_in_waiting_for_playback_drain_ && audio_service_.IsPlaybackIdle()) {
+                barge_in_waiting_for_playback_drain_ = false;
+                LogVoiceMetric("BARGE_IN_PLAYBACK_STOP", voice_metric_turn_id_);
+            }
+#endif
+#if CONFIG_VOICE_LATENCY_METRICS
+            if (turn_completion_waiting_for_playback_drain_ && audio_service_.IsPlaybackIdle()) {
+                turn_completion_waiting_for_playback_drain_ = false;
+                LogVoiceMetric("TURN_COMPLETED", voice_metric_turn_id_);
+            }
+#endif
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
             if (pending_listening_start_ && GetDeviceState() == kDeviceStateListening &&
@@ -300,7 +390,69 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
-            if (GetDeviceState() == kDeviceStateListening) {
+            auto state = GetDeviceState();
+#if CONFIG_LISTENER_FEEDBACK
+            if (audio_service_.IsVoiceDetected() &&
+                audio_service_.IsListenerFeedbackPlaying()) {
+                ESP_LOGI(TAG, "Near-end voice cancelled listener feedback");
+                audio_service_.CancelListenerFeedback();
+            }
+#endif
+#if CONFIG_VOICE_LATENCY_METRICS
+            if (state == kDeviceStateListening) {
+                if (audio_service_.IsVoiceDetected()) {
+                    ++voice_metric_turn_id_;
+                    LogVoiceMetric("USER_AUDIO_START", voice_metric_turn_id_);
+                } else {
+                    LogVoiceMetric("DEVICE_VAD_END", voice_metric_turn_id_);
+                }
+            }
+#endif
+#if CONFIG_LOCAL_VAD_BARGE_IN
+            if (state == kDeviceStateSpeaking &&
+                listening_mode_ == kListeningModeRealtime) {
+                if (!audio_service_.IsVoiceDetected()) {
+                    local_vad_barge_in_armed_ = true;
+                } else if (local_vad_barge_in_armed_ && !aborted_) {
+                    const uint32_t now_ms =
+                        static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                    if (barge_in_guard_.IsBlocked(now_ms)) {
+                        ESP_LOGI(TAG, "Local VAD barge-in suppressed during playback guard");
+                    } else {
+                        local_vad_barge_in_armed_ = false;
+#if CONFIG_VOICE_LATENCY_METRICS
+                        ++voice_metric_turn_id_;
+                        LogVoiceMetric("USER_AUDIO_START", voice_metric_turn_id_);
+#endif
+#if CONFIG_ML307_LOCAL_VAD_BARGE_IN
+                        ESP_LOGI(TAG, "Local VAD barge-in");
+#if CONFIG_VOICE_LATENCY_METRICS
+                        LogVoiceMetric("BARGE_IN_DETECTED", voice_metric_turn_id_);
+                        barge_in_waiting_for_playback_drain_ = true;
+                        turn_completion_waiting_for_playback_drain_ = false;
+#endif
+                        ml307_local_barge_in_pending_ = true;
+                        audio_service_.ResetDecoder();
+                        AbortSpeaking(kAbortReasonNone);
+#if CONFIG_VOICE_LATENCY_METRICS
+                        LogVoiceMetric("TURN_CANCELLED", voice_metric_turn_id_);
+#endif
+                        // Keep the modem uplink gated until the server TTS stop event.
+                        // This avoids overlapping MQTT abort and UDP MIPSEND commands.
+#else
+                        // Wi-Fi full duplex keeps AEC audio flowing upstream. Local VAD
+                        // only marks a speech candidate; mode 5 owns the semantic
+                        // decision and sends TTS stop only after confirmation.
+                        ESP_LOGI(TAG, "Local VAD speech candidate");
+#if CONFIG_VOICE_LATENCY_METRICS
+                        LogVoiceMetric("LOCAL_SPEECH_CANDIDATE", voice_metric_turn_id_);
+#endif
+#endif
+                    }
+                }
+            }
+#endif
+            if (state == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
             }
@@ -368,8 +520,8 @@ void Application::HandleNetworkDisconnectedEvent() {
     }
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
-        // A connection task may still be inside OpenAudioChannel. Its
-        // completion callback will close the stale transport safely.
+        // OpenAudioChannel may still own the protocol from the phone connection
+        // task. Its completion callback will close the stale channel safely.
         if (!phone_connect_task_running_.load()) {
             ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
             protocol_->CloseAudioChannel();
@@ -483,9 +635,9 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 2;
     int retry_count = 0;
-    int retry_delay = 10;  // Initial retry delay in seconds
+    int retry_delay = 2;  // Initial retry delay in seconds
 
     auto& board = Board::GetInstance();
     while (true) {
@@ -494,6 +646,14 @@ void Application::CheckNewVersion() {
 
         esp_err_t err = ota_->CheckVersion();
         if (err != ESP_OK) {
+            if (ota_->HasCachedProtocolConfig()) {
+                ESP_LOGW(TAG,
+                         "OTA metadata refresh failed; continuing with cached public protocol "
+                         "configuration, code=%d",
+                         err);
+                return;
+            }
+
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
@@ -520,7 +680,7 @@ void Application::CheckNewVersion() {
             continue;
         }
         retry_count = 0;
-        retry_delay = 10;  // Reset retry delay
+        retry_delay = 2;  // Reset retry delay
 
         if (ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
@@ -626,13 +786,44 @@ void Application::InitializeProtocol() {
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         const bool phone_audio = phone_call_controller_.IsConnected();
-        if ((GetDeviceState() == kDeviceStateSpeaking || phone_audio) && !aborted_.load()) {
+        const bool accept_remote_audio =
+            (GetDeviceState() == kDeviceStateSpeaking || phone_audio) && !aborted_.load();
+        if (accept_remote_audio) {
             const bool first_phone_audio = phone_audio && StopPhoneRingbackForRemoteAudio();
+#if CONFIG_LOCAL_VAD_BARGE_IN
+            const uint32_t now_ms =
+                static_cast<uint32_t>(esp_timer_get_time() / 1000);
+            if (barge_in_guard_.MarkFirstAssistantAudio(
+                    now_ms, CONFIG_LOCAL_VAD_BARGE_IN_GUARD_MS)) {
+                ESP_LOGI(TAG, "Local VAD barge-in guard started: %d ms",
+                         CONFIG_LOCAL_VAD_BARGE_IN_GUARD_MS);
+            }
+#endif
+#if CONFIG_VOICE_LATENCY_METRICS
+            if (!device_first_audio_logged_) {
+                device_first_audio_logged_ = true;
+                LogVoiceMetric("DEVICE_FIRST_AUDIO_RECEIVED", voice_metric_turn_id_);
+            }
+#endif
             if (first_phone_audio) {
                 ESP_LOGI(TAG, "Playing local phone pickup sound before remote greeting");
                 audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_CONNECT);
             }
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+            std::string output_id;
+            {
+                std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+                output_id = active_remote_output_id_;
+            }
+            if (!output_id.empty()) {
+                audio_service_.BeginRemotePlayback(output_id);
+                audio_service_.PushRemotePacketToDecodeQueue(std::move(packet), output_id);
+            } else {
+                audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            }
+#else
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+#endif
         }
     });
 
@@ -657,8 +848,17 @@ void Application::InitializeProtocol() {
             phone_hangup_ready_.store(false);
             phone_hangup_sound_playing_.store(false);
             phone_hangup_requested_us_ = 0;
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+            {
+                std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+                active_remote_output_id_.clear();
+            }
+            audio_service_.ResetDecoder();
+#endif
             if (server_hung_up || hangup_interrupted) {
+#if !CONFIG_DUPLEX_PLAYBACK_CONTROL
                 audio_service_.ResetDecoder();
+#endif
                 audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_HANGUP);
             }
             if (!phone_connect_task_running_.load()) {
@@ -683,12 +883,87 @@ void Application::InitializeProtocol() {
                 return;
             }
             if (strcmp(state->valuestring, "start") == 0) {
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+                std::string output_id;
+                auto payload = cJSON_GetObjectItem(root, "payload");
+                if (cJSON_IsObject(payload)) {
+                    auto output_id_item = cJSON_GetObjectItem(payload, "output_id");
+                    if (cJSON_IsString(output_id_item)) {
+                        const size_t output_id_length = strnlen(
+                            output_id_item->valuestring, kMaxPlaybackOutputIdLength + 1);
+                        if (output_id_length <= kMaxPlaybackOutputIdLength) {
+                            output_id.assign(output_id_item->valuestring, output_id_length);
+                        } else {
+                            ESP_LOGW(TAG, "Ignoring oversized playback output_id");
+                        }
+                    }
+                }
+                if (!output_id.empty()) {
+                    {
+                        std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+                        active_remote_output_id_ = output_id;
+                    }
+                    // Register the output before the first audio packet arrives so an
+                    // early duck/cancel cannot be rejected as stale.
+                    audio_service_.BeginRemotePlayback(output_id);
+                }
+#endif
                 Schedule([this]() {
+                    auto call_state = phone_call_controller_.state();
+                    if (call_state == PhoneCallState::kHangingUp ||
+                        call_state == PhoneCallState::kFailed) {
+                        return;
+                    }
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+                std::string output_id;
+                std::string reason = "completed";
+                auto payload = cJSON_GetObjectItem(root, "payload");
+                if (cJSON_IsObject(payload)) {
+                    auto output_id_item = cJSON_GetObjectItem(payload, "output_id");
+                    auto reason_item = cJSON_GetObjectItem(payload, "reason");
+                    if (cJSON_IsString(output_id_item)) {
+                        const size_t output_id_length = strnlen(
+                            output_id_item->valuestring, kMaxPlaybackOutputIdLength + 1);
+                        if (output_id_length <= kMaxPlaybackOutputIdLength) {
+                            output_id.assign(output_id_item->valuestring, output_id_length);
+                        }
+                    }
+                    if (cJSON_IsString(reason_item)) {
+                        const size_t reason_length = strnlen(
+                            reason_item->valuestring, kMaxPlaybackReasonLength + 1);
+                        if (reason_length <= kMaxPlaybackReasonLength) {
+                            reason.assign(reason_item->valuestring, reason_length);
+                        }
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+                    if (output_id.empty()) {
+                        output_id = active_remote_output_id_;
+                    }
+                    if (output_id == active_remote_output_id_) {
+                        active_remote_output_id_.clear();
+                    }
+                }
+                if (!output_id.empty()) {
+                    audio_service_.EndRemotePlayback(output_id, reason);
+                }
+#endif
                 Schedule([this]() {
+#if CONFIG_VOICE_LATENCY_METRICS
+                    turn_completion_waiting_for_playback_drain_ = true;
+                    if (audio_service_.IsPlaybackIdle()) {
+                        turn_completion_waiting_for_playback_drain_ = false;
+                        LogVoiceMetric("TURN_COMPLETED", voice_metric_turn_id_);
+                    }
+#endif
+                    if (phone_call_controller_.state() == PhoneCallState::kHangingUp) {
+                        return;
+                    }
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -713,7 +988,101 @@ void Application::InitializeProtocol() {
                     });
                 }
             }
-        } else if (strcmp(type->valuestring, "phone_hangup") == 0) {
+        }
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+        else if (strcmp(type->valuestring, "playback_control") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            auto action_item = cJSON_IsObject(payload)
+                                   ? cJSON_GetObjectItem(payload, "action")
+                                   : nullptr;
+            auto output_id_item = cJSON_IsObject(payload)
+                                      ? cJSON_GetObjectItem(payload, "output_id")
+                                      : nullptr;
+            if (!cJSON_IsString(action_item) || !cJSON_IsString(output_id_item)) {
+                ESP_LOGW(TAG, "Invalid playback_control payload");
+                return;
+            }
+            float target_gain_db = 0.0f;
+            auto gain_item = cJSON_GetObjectItem(payload, "target_gain_db");
+            if (cJSON_IsNumber(gain_item)) {
+                target_gain_db = static_cast<float>(gain_item->valuedouble);
+            }
+            const size_t action_length = strnlen(
+                action_item->valuestring, kMaxPlaybackActionLength + 1);
+            const size_t output_id_length = strnlen(
+                output_id_item->valuestring, kMaxPlaybackOutputIdLength + 1);
+            if (action_length == 0 || action_length > kMaxPlaybackActionLength ||
+                output_id_length == 0 || output_id_length > kMaxPlaybackOutputIdLength) {
+                ESP_LOGW(TAG, "Rejected oversized or empty playback_control fields");
+                return;
+            }
+            std::string action(action_item->valuestring, action_length);
+            std::string output_id(output_id_item->valuestring, output_id_length);
+            Schedule([this, action, output_id, target_gain_db]() {
+                RemotePlaybackAction control;
+                if (action == "duck") {
+                    control = RemotePlaybackAction::kDuck;
+                } else if (action == "pause") {
+                    control = RemotePlaybackAction::kPause;
+                } else if (action == "resume") {
+                    control = RemotePlaybackAction::kResume;
+                } else if (action == "cancel") {
+                    control = RemotePlaybackAction::kCancel;
+                } else {
+                    ESP_LOGW(TAG, "Unsupported playback control: %s", action.c_str());
+                    return;
+                }
+                const bool controlled =
+                    audio_service_.ControlRemotePlayback(output_id, control, target_gain_db);
+                if (!controlled) {
+                    ESP_LOGW(TAG, "Ignored stale playback control: action=%s output_id=%s",
+                             action.c_str(), output_id.c_str());
+                }
+                if (controlled && control == RemotePlaybackAction::kCancel) {
+                    aborted_ = true;
+                    std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+                    if (active_remote_output_id_ == output_id) {
+                        active_remote_output_id_.clear();
+                    }
+                }
+            });
+        }
+#endif
+#if CONFIG_LISTENER_FEEDBACK
+        else if (strcmp(type->valuestring, "listener_feedback") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            auto clip_id_item = cJSON_IsObject(payload)
+                                    ? cJSON_GetObjectItem(payload, "clip_id")
+                                    : nullptr;
+            if (!cJSON_IsString(state) || strcmp(state->valuestring, "play") != 0 ||
+                !cJSON_IsString(clip_id_item)) {
+                ESP_LOGW(TAG, "Invalid listener_feedback payload");
+                return;
+            }
+            const size_t clip_id_length = strnlen(
+                clip_id_item->valuestring, kMaxFeedbackClipIdLength + 1);
+            if (clip_id_length == 0 || clip_id_length > kMaxFeedbackClipIdLength) {
+                ESP_LOGW(TAG, "Rejected oversized or empty listener feedback clip_id");
+                return;
+            }
+            std::string clip_id(clip_id_item->valuestring, clip_id_length);
+            auto sound = ListenerFeedbackSound(clip_id.c_str());
+            if (sound.empty()) {
+                ESP_LOGW(TAG, "Unknown listener feedback clip: %s", clip_id.c_str());
+                return;
+            }
+            Schedule([this, clip_id, sound]() {
+                if (GetDeviceState() != kDeviceStateListening ||
+                    audio_service_.IsVoiceDetected()) {
+                    ESP_LOGI(TAG, "Suppress listener feedback because user floor is not open");
+                    return;
+                }
+                audio_service_.PlayListenerFeedback(clip_id, sound);
+            });
+        }
+#endif
+        else if (strcmp(type->valuestring, "phone_hangup") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (cJSON_IsString(state) && strcmp(state->valuestring, "ready") == 0) {
                 Schedule([this]() {
@@ -859,6 +1228,10 @@ void Application::SetPhoneHookState(bool off_hook) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_PHONE_HOOK_CHANGED);
 }
 
+void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
+
+void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
+
 void Application::HandleTogglePhoneCallEvent() {
     switch (phone_call_controller_.state()) {
         case PhoneCallState::kIdle:
@@ -918,12 +1291,17 @@ void Application::BeginPhoneCall() {
 
     const ListeningMode mode = GetDefaultListeningMode();
     SetDeviceState(kDeviceStateConnecting);
-    // Start transport setup before enqueueing the local intro so connection
-    // latency is hidden behind the first ring.
+    // Start transport setup before enqueueing the four-second local intro.
+    // PlaySound can block for roughly 1.4 seconds while its Opus packets wait
+    // for decode-queue capacity. Running the lower-priority connection task in
+    // parallel hides that setup behind the first ring without starving audio.
     StartPhoneConnectionTask(mode, generation);
     if (!phone_call_controller_.IsConnecting(generation)) {
         return;
     }
+
+    // Keep the initial cue and first ring in one Ogg stream. Enqueuing two Ogg
+    // streams back-to-back creates an audible seam on small speakers.
     audio_service_.PlaySound(kPhoneCallingIntroSound);
 }
 
@@ -938,7 +1316,8 @@ void Application::StartPhoneConnectionTask(ListeningMode mode, uint32_t generati
             app->RunPhoneConnectionTask();
             vTaskDelete(nullptr);
         },
-        "phone_connect", kPhoneConnectTaskStackSize, this, kPhoneConnectTaskPriority, nullptr);
+        "phone_connect", kPhoneConnectTaskStackSize, this,
+        kPhoneConnectTaskPriority, nullptr);
     if (result != pdPASS) {
         phone_connect_task_running_.store(false);
         FailPhoneCall(generation, "failed to create connection task");
@@ -956,13 +1335,16 @@ void Application::RunPhoneConnectionTask() {
         opened = protocol_->IsAudioChannelOpened() || protocol_->OpenAudioChannel();
     }
 
+    // OpenAudioChannel has returned, so the main task may safely close a stale
+    // transport from this point onward.
     phone_connect_task_running_.store(false);
     Schedule([this, mode, generation, opened]() {
         CompletePhoneConnection(mode, generation, opened);
     });
 }
 
-void Application::CompletePhoneConnection(ListeningMode mode, uint32_t generation, bool opened) {
+void Application::CompletePhoneConnection(ListeningMode mode, uint32_t generation,
+                                          bool opened) {
     if (!phone_call_controller_.IsConnecting(generation)) {
         if (protocol_) {
             protocol_->CloseAudioChannel();
@@ -1017,8 +1399,11 @@ void Application::HangUpPhoneCall() {
 }
 
 void Application::CompletePhoneHangup(const char* reason) {
-    if (phone_call_controller_.state() != PhoneCallState::kHangingUp ||
-        phone_hangup_sound_playing_.load()) {
+    if (phone_call_controller_.state() != PhoneCallState::kHangingUp) {
+        return;
+    }
+
+    if (phone_hangup_sound_playing_.load()) {
         return;
     }
 
@@ -1047,8 +1432,8 @@ void Application::FinalizePhoneHangup(const char* reason) {
     phone_hangup_sound_playing_.store(false);
     phone_hangup_requested_us_ = 0;
 
-    // Mark idle first so the transport close callback does not enqueue a
-    // duplicate local hang-up sound.
+    // Mark idle before closing so the transport callback cannot enqueue a
+    // duplicate local hang-up sound after the local sound has drained.
     phone_call_controller_.Finish();
     if (!phone_connect_task_running_.load() && protocol_) {
         protocol_->CloseAudioChannel();
@@ -1092,15 +1477,17 @@ void Application::HandlePhoneCallClockTick() {
         } else if (phone_hangup_ready_.load() && audio_service_.IsPlaybackIdle()) {
             CompletePhoneHangup("farewell drained on clock tick");
         } else if (phone_hangup_requested_us_ > 0 &&
-                   esp_timer_get_time() - phone_hangup_requested_us_ >= kPhoneHangupTimeoutUs) {
+                   esp_timer_get_time() - phone_hangup_requested_us_ >=
+                       kPhoneHangupTimeoutUs) {
             ESP_LOGW(TAG, "Phone farewell timeout; playing local hang-up sound");
             CompletePhoneHangup("farewell timeout");
         }
         return;
     }
-
-    if (!phone_ringback_active_.load() ||
-        (state != PhoneCallState::kConnecting && state != PhoneCallState::kConnected)) {
+    if (!phone_ringback_active_.load()) {
+        return;
+    }
+    if (state != PhoneCallState::kConnecting && state != PhoneCallState::kConnected) {
         return;
     }
 
@@ -1124,10 +1511,6 @@ bool Application::StopPhoneRingbackForRemoteAudio() {
     audio_service_.ResetDecoder();
     return true;
 }
-
-void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
-
-void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
@@ -1344,6 +1727,14 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+#if CONFIG_LOCAL_VAD_BARGE_IN
+            local_vad_barge_in_armed_ = false;
+            barge_in_waiting_for_playback_drain_ = false;
+#endif
+#if CONFIG_ML307_LOCAL_VAD_BARGE_IN
+            audio_service_.SetUplinkAudioEnabled(true, false);
+            ml307_local_barge_in_pending_ = false;
+#endif
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();    // Clear messages first
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
@@ -1356,6 +1747,15 @@ void Application::HandleStateChangedEvent() {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+#if CONFIG_LOCAL_VAD_BARGE_IN
+            local_vad_barge_in_armed_ = false;
+#endif
+#if CONFIG_ML307_LOCAL_VAD_BARGE_IN
+            audio_service_.SetUplinkAudioEnabled(true, ml307_local_barge_in_pending_);
+            ESP_LOGI(TAG, "ML307 uplink resumed, flush_preroll=%d",
+                     ml307_local_barge_in_pending_);
+            ml307_local_barge_in_pending_ = false;
+#endif
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
@@ -1377,12 +1777,51 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
+#if CONFIG_LOCAL_VAD_BARGE_IN
+            barge_in_guard_.ResetForAssistantTurn();
+            if (listening_mode_ == kListeningModeRealtime) {
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+                const bool preplay_user_continuation = audio_service_.IsVoiceDetected();
+                local_vad_barge_in_armed_ = !preplay_user_continuation;
+                ESP_LOGI(TAG, "Local VAD barge-in armed=%d",
+                         local_vad_barge_in_armed_);
+                if (preplay_user_continuation && !aborted_) {
+                    ESP_LOGI(TAG,
+                             "Preplay user continuation detected; aborting assistant before "
+                             "first audio");
+#if CONFIG_VOICE_LATENCY_METRICS
+                    LogVoiceMetric("PREPLAY_CONTINUATION_CANCEL", voice_metric_turn_id_);
+#endif
+                    AbortSpeaking(kAbortReasonNone);
+                }
+#else
+                local_vad_barge_in_armed_ = !audio_service_.IsVoiceDetected();
+                ESP_LOGI(TAG, "Local VAD barge-in armed=%d",
+                         local_vad_barge_in_armed_);
+#endif
+            }
+#endif
+#if CONFIG_ML307_LOCAL_VAD_BARGE_IN
+            if (listening_mode_ == kListeningModeRealtime) {
+                audio_service_.SetUplinkAudioEnabled(false);
+                ml307_local_barge_in_pending_ = false;
+            }
+#endif
+#if CONFIG_VOICE_LATENCY_METRICS
+            device_first_audio_logged_ = false;
+            turn_completion_waiting_for_playback_drain_ = false;
+            audio_service_.ArmPlaybackMetric(voice_metric_turn_id_);
+#endif
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
+            // A phone ringback remains audible until the first remote audio
+            // frame, not merely until the earlier tts:start control packet.
+            if (!phone_ringback_active_.load()) {
+                audio_service_.ResetDecoder();
+            }
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
@@ -1403,7 +1842,9 @@ void Application::StartListeningAudio() {
 
     // Send the start listening command
     protocol_->SendStartListening(listening_mode_);
-    audio_service_.EnableVoiceProcessing(true);
+    const bool preserve_phone_ringback = phone_call_controller_.IsConnected() &&
+                                         phone_ringback_active_.load();
+    audio_service_.EnableVoiceProcessing(true, preserve_phone_ringback);
 
     ConfigureWakeWordForListening();
 
@@ -1607,6 +2048,13 @@ void Application::PlaySound(const std::string_view& sound) { audio_service_.Play
 
 void Application::ResetProtocol() {
     Schedule([this]() {
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+        {
+            std::lock_guard<std::mutex> lock(playback_protocol_mutex_);
+            active_remote_output_id_.clear();
+        }
+        audio_service_.ResetDecoder();
+#endif
         // Close audio channel if opened
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();

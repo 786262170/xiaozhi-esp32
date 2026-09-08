@@ -25,6 +25,17 @@ class VersionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build._version_matches((6, 0, 1), "~=6.0")
 
+    def test_ota_url_sdkconfig_option_validates_and_encodes_url(self):
+        self.assertEqual(
+            build._ota_url_sdkconfig_option(
+                "https://voice-test.shanding.xyz/xiaozhi/ota/"
+            ),
+            'CONFIG_OTA_URL="https://voice-test.shanding.xyz/xiaozhi/ota/"',
+        )
+        for value in ("file:///tmp/ota", "http://", 'http://host/"bad'):
+            with self.assertRaises(ValueError):
+                build._ota_url_sdkconfig_option(value)
+
     def test_current_matrix_uniqueness_and_p4_variants(self):
         idf5 = build._collect_variants(idf_version=(5, 5, 4))
         idf6 = build._collect_variants(idf_version=(6, 0, 1))
@@ -1060,6 +1071,7 @@ class CliTests(unittest.TestCase):
             create_zip=False,
             language=None,
             wake_word=None,
+            ota_url=None,
             idf_version=(6, 0, 2),
         )
 

@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
@@ -202,6 +203,15 @@ void AudioService::Stop() {
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
         audio_testing_queue_.clear();
+        remote_output_id_.clear();
+        remote_played_ms_ = 0;
+        remote_last_reported_ms_ = 0;
+        remote_stop_pending_ = false;
+        remote_stop_reason_.clear();
+        playback_gain_linear_ = 1.0f;
+        remote_playback_paused_ = false;
+        listener_feedback_playing_ = false;
+        listener_feedback_id_.clear();
         notify_drained = MarkPlaybackDrainedLocked();
         audio_queue_cv_.notify_all();
     }
@@ -245,6 +255,70 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
+
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+    // The AEC diagnostic build uses this to distinguish a silent/incorrect
+    // ES7210 input path from failures later in AFE/VAD or the cloud pipeline.
+    // The production Wi-Fi and cellular builds leave this code compiled out.
+    constexpr int kDiagnosticChannelLimit = 4;
+    static uint64_t square_sum[kDiagnosticChannelLimit] = {};
+    static uint32_t sample_count[kDiagnosticChannelLimit] = {};
+    static uint32_t nonzero_count[kDiagnosticChannelLimit] = {};
+    static int32_t peak[kDiagnosticChannelLimit] = {};
+    static int64_t window_started_us = 0;
+
+    const int channel_count = codec_->input_channels();
+    const int measured_channels =
+        channel_count < kDiagnosticChannelLimit ? channel_count : kDiagnosticChannelLimit;
+    for (size_t frame = 0; frame < data.size() / channel_count; ++frame) {
+        for (int channel = 0; channel < measured_channels; ++channel) {
+            const int32_t value = data[frame * channel_count + channel];
+            const int32_t magnitude = value < 0 ? -value : value;
+            if (magnitude > peak[channel]) {
+                peak[channel] = magnitude;
+            }
+            square_sum[channel] += static_cast<uint64_t>(value * value);
+            sample_count[channel]++;
+            if (value != 0) {
+                nonzero_count[channel]++;
+            }
+        }
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (window_started_us == 0) {
+        window_started_us = now_us;
+    } else if (now_us - window_started_us >= 1000000) {
+        int rms[kDiagnosticChannelLimit] = {};
+        for (int channel = 0; channel < measured_channels; ++channel) {
+            if (sample_count[channel] > 0) {
+                rms[channel] = static_cast<int>(
+                    std::sqrt(static_cast<double>(square_sum[channel]) / sample_count[channel]));
+            }
+        }
+        ESP_LOGI(TAG,
+                 "MIC_INPUT_METRIC channels=%d "
+                 "ch0_peak=%ld ch0_rms=%d ch0_nonzero=%lu "
+                 "ch1_peak=%ld ch1_rms=%d ch1_nonzero=%lu "
+                 "ch2_peak=%ld ch2_rms=%d ch2_nonzero=%lu "
+                 "ch3_peak=%ld ch3_rms=%d ch3_nonzero=%lu",
+                 channel_count, static_cast<long>(peak[0]), rms[0],
+                 static_cast<unsigned long>(nonzero_count[0]),
+                 static_cast<long>(peak[1]), rms[1],
+                 static_cast<unsigned long>(nonzero_count[1]),
+                 static_cast<long>(peak[2]), rms[2],
+                 static_cast<unsigned long>(nonzero_count[2]),
+                 static_cast<long>(peak[3]), rms[3],
+                 static_cast<unsigned long>(nonzero_count[3]));
+        for (int channel = 0; channel < kDiagnosticChannelLimit; ++channel) {
+            square_sum[channel] = 0;
+            sample_count[channel] = 0;
+            nonzero_count[channel] = 0;
+            peak[channel] = 0;
+        }
+        window_started_us = now_us;
+    }
+#endif
 
 #if CONFIG_USE_AUDIO_DEBUGGER
     // 音频调试：发送原始音频数据
@@ -307,7 +381,7 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                // If input channels is 2, we need to fetch the left channel data
+                // If input channels is 2, fetch the microphone in the first channel.
                 if (codec_->input_channels() == 2) {
                     auto mono_data = std::vector<int16_t>(data.size() / 2);
                     for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
@@ -340,8 +414,16 @@ void AudioService::AudioInputTask() {
 void AudioService::AudioOutputTask() {
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-        audio_queue_cv_.wait(
-            lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_.load(); });
+        audio_queue_cv_.wait(lock, [this]() {
+            if (service_stopped_.load()) {
+                return true;
+            }
+            if (audio_playback_queue_.empty()) {
+                return false;
+            }
+            const auto& next = audio_playback_queue_.front();
+            return !remote_playback_paused_ || next->output_id != remote_output_id_;
+        });
         if (service_stopped_.load()) {
             break;
         }
@@ -349,6 +431,10 @@ void AudioService::AudioOutputTask() {
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
         output_in_flight_ = true;
+        float gain_linear = task->gain_linear;
+        if (!task->output_id.empty() && task->output_id == remote_output_id_) {
+            gain_linear *= playback_gain_linear_;
+        }
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -358,6 +444,14 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+#if CONFIG_VOICE_LATENCY_METRICS
+        if (playback_metric_armed_.exchange(false)) {
+            ESP_LOGI(TAG, "VOICE_METRIC event=DEVICE_PCM_PLAYBACK_START turn_id=%lu ts_mono_ms=%lld",
+                     static_cast<unsigned long>(playback_metric_turn_id_.load()),
+                     static_cast<long long>(esp_timer_get_time() / 1000));
+        }
+#endif
+        ApplyPcmGain(task->pcm, gain_linear);
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
@@ -365,6 +459,11 @@ void AudioService::AudioOutputTask() {
         debug_statistics_.playback_count++;
 
         bool notify_drained = false;
+        bool report_progress = false;
+        std::string progress_output_id;
+        int64_t progress_played_ms = 0;
+        int64_t progress_buffered_ms = 0;
+        int64_t progress_device_ts = 0;
         lock.lock();
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
@@ -372,11 +471,33 @@ void AudioService::AudioOutputTask() {
             timestamp_queue_.push_back(task->timestamp);
         }
 #endif
+        if (!task->listener_feedback && !task->output_id.empty() &&
+            task->output_id == remote_output_id_) {
+            remote_played_ms_ += task->frame_duration_ms;
+            if (remote_played_ms_ - remote_last_reported_ms_ >= 180) {
+                remote_last_reported_ms_ = remote_played_ms_;
+                report_progress = true;
+                progress_output_id = remote_output_id_;
+                progress_played_ms = remote_played_ms_;
+                progress_buffered_ms = BufferedRemotePlaybackMsLocked(remote_output_id_);
+                progress_device_ts = esp_timer_get_time() / 1000;
+            }
+        }
         output_in_flight_ = false;
         notify_drained = MarkPlaybackDrainedLocked();
+        if (task->listener_feedback) {
+            listener_feedback_playing_ = HasListenerFeedbackLocked();
+            if (!listener_feedback_playing_) {
+                listener_feedback_id_.clear();
+            }
+        }
         audio_queue_cv_.notify_all();
         lock.unlock();
 
+        if (report_progress && callbacks_.on_playback_progress) {
+            callbacks_.on_playback_progress(progress_output_id, progress_played_ms,
+                                            progress_buffered_ms, progress_device_ts);
+        }
         if (notify_drained && callbacks_.on_playback_drained) {
             callbacks_.on_playback_drained();
         }
@@ -403,6 +524,7 @@ void AudioService::OpusCodecTask() {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
             decode_in_flight_ = true;
+            decode_in_flight_listener_feedback_ = packet->listener_feedback;
             const uint32_t generation = playback_generation_;
             audio_queue_cv_.notify_all();
             lock.unlock();
@@ -410,6 +532,10 @@ void AudioService::OpusCodecTask() {
             auto task = std::make_unique<AudioTask>();
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
+            task->frame_duration_ms = packet->frame_duration;
+            task->output_id = packet->output_id;
+            task->listener_feedback = packet->listener_feedback;
+            task->gain_linear = packet->gain_linear;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             bool decoded = false;
@@ -458,6 +584,7 @@ void AudioService::OpusCodecTask() {
                 audio_playback_queue_.push_back(std::move(task));
             }
             decode_in_flight_ = false;
+            decode_in_flight_listener_feedback_ = false;
             debug_statistics_.decode_count++;
             const bool notify_drained = MarkPlaybackDrainedLocked();
             audio_queue_cv_.notify_all();
@@ -495,16 +622,28 @@ void AudioService::OpusCodecTask() {
                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
 
                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
+                        bool notify_send_queue = false;
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            /* Never let a full send queue stall encoding: stale realtime
-                             * audio is useless to the server, so drop the oldest packet. */
-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
-                                audio_send_queue_.pop_front();
+                            if (uplink_audio_enabled_.load()) {
+                                /* Never let a full send queue stall encoding: stale realtime
+                                 * audio is useless to the server, so drop the oldest packet. */
+                                if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                                    audio_send_queue_.pop_front();
+                                }
+                                audio_send_queue_.push_back(std::move(packet));
+                                notify_send_queue = true;
+                            } else {
+                                /* Keep only the speech onset needed for local barge-in.
+                                 * AEC/VAD and Opus stay warm while the modem uplink is gated. */
+                                if (gated_uplink_preroll_.size() >=
+                                    GATED_UPLINK_PREROLL_PACKETS) {
+                                    gated_uplink_preroll_.pop_front();
+                                }
+                                gated_uplink_preroll_.push_back(std::move(packet));
                             }
-                            audio_send_queue_.push_back(std::move(packet));
                         }
-                        if (callbacks_.on_send_queue_available) {
+                        if (notify_send_queue && callbacks_.on_send_queue_available) {
                             callbacks_.on_send_queue_available();
                         }
                     } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
@@ -684,6 +823,154 @@ bool AudioService::ReadExternalPcm(int16_t* samples, size_t sample_count, int ti
     return true;
 }
 
+bool AudioService::PushRemotePacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet,
+                                                 const std::string& output_id) {
+    if (packet == nullptr || output_id.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (remote_output_id_ != output_id) {
+            remote_output_id_ = output_id;
+            remote_played_ms_ = 0;
+            remote_last_reported_ms_ = 0;
+            remote_stop_pending_ = false;
+            remote_stop_reason_.clear();
+            playback_gain_linear_ = 1.0f;
+            remote_playback_paused_ = false;
+        }
+        packet->output_id = output_id;
+    }
+    return PushPacketToDecodeQueue(std::move(packet));
+}
+
+void AudioService::BeginRemotePlayback(const std::string& output_id) {
+    if (output_id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (remote_output_id_ == output_id) {
+        return;
+    }
+    remote_output_id_ = output_id;
+    remote_played_ms_ = 0;
+    remote_last_reported_ms_ = 0;
+    remote_stop_pending_ = false;
+    remote_stop_reason_.clear();
+    playback_gain_linear_ = 1.0f;
+    remote_playback_paused_ = false;
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::EndRemotePlayback(const std::string& output_id, const std::string& reason) {
+    if (output_id.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (remote_output_id_ != output_id) {
+            return;
+        }
+        remote_stop_pending_ = true;
+        remote_stop_reason_ = reason.empty() ? "completed" : reason;
+    }
+    CompleteRemotePlaybackIfDrained();
+}
+
+bool AudioService::ControlRemotePlayback(const std::string& output_id,
+                                         RemotePlaybackAction action,
+                                         float target_gain_db) {
+    if (output_id.empty()) {
+        return false;
+    }
+
+    bool notify_drained = false;
+    bool report_stopped = false;
+    int64_t stopped_played_ms = 0;
+    std::string stopped_reason;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (remote_output_id_ != output_id) {
+            return false;
+        }
+        switch (action) {
+            case RemotePlaybackAction::kDuck:
+                playback_gain_linear_ = GainDbToLinear(target_gain_db);
+                break;
+            case RemotePlaybackAction::kPause:
+                remote_playback_paused_ = true;
+                break;
+            case RemotePlaybackAction::kResume:
+                playback_gain_linear_ = 1.0f;
+                remote_playback_paused_ = false;
+                break;
+            case RemotePlaybackAction::kCancel: {
+                ++playback_generation_;
+                const auto matches_output = [&output_id](const auto& item) {
+                    return item != nullptr && item->output_id == output_id;
+                };
+                audio_decode_queue_.erase(
+                    std::remove_if(audio_decode_queue_.begin(), audio_decode_queue_.end(),
+                                   matches_output),
+                    audio_decode_queue_.end());
+                audio_playback_queue_.erase(
+                    std::remove_if(audio_playback_queue_.begin(), audio_playback_queue_.end(),
+                                   matches_output),
+                    audio_playback_queue_.end());
+                std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+                if (opus_decoder_ != nullptr) {
+                    esp_opus_dec_reset(opus_decoder_);
+                }
+                decoder_lock.unlock();
+                report_stopped = true;
+                stopped_played_ms = remote_played_ms_;
+                stopped_reason = "cancelled";
+                remote_output_id_.clear();
+                remote_stop_pending_ = false;
+                remote_stop_reason_.clear();
+                playback_gain_linear_ = 1.0f;
+                remote_playback_paused_ = false;
+                notify_drained = MarkPlaybackDrainedLocked();
+                break;
+            }
+        }
+        audio_queue_cv_.notify_all();
+    }
+
+    if (report_stopped && callbacks_.on_playback_stopped) {
+        callbacks_.on_playback_stopped(output_id, stopped_played_ms, stopped_reason,
+                                       esp_timer_get_time() / 1000);
+    }
+    if (notify_drained && callbacks_.on_playback_drained) {
+        callbacks_.on_playback_drained();
+    }
+    return true;
+}
+
+void AudioService::CompleteRemotePlaybackIfDrained() {
+    std::string output_id;
+    std::string reason;
+    int64_t played_ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (!remote_stop_pending_ || remote_output_id_.empty() || !IsPlaybackDrainedLocked()) {
+            return;
+        }
+        output_id = remote_output_id_;
+        played_ms = remote_played_ms_;
+        reason = remote_stop_reason_.empty() ? "completed" : remote_stop_reason_;
+        remote_output_id_.clear();
+        remote_stop_pending_ = false;
+        remote_stop_reason_.clear();
+        playback_gain_linear_ = 1.0f;
+        remote_playback_paused_ = false;
+    }
+    if (callbacks_.on_playback_stopped) {
+        callbacks_.on_playback_stopped(output_id, played_ms, reason,
+                                       esp_timer_get_time() / 1000);
+    }
+}
+
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     if (audio_send_queue_.empty()) {
@@ -693,6 +980,38 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     audio_send_queue_.pop_front();
     audio_queue_cv_.notify_all();
     return packet;
+}
+
+void AudioService::SetUplinkAudioEnabled(bool enabled, bool flush_preroll) {
+    bool notify_send_queue = false;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (uplink_audio_enabled_.load() == enabled) {
+            return;
+        }
+
+        uplink_audio_enabled_.store(enabled);
+        if (!enabled) {
+            audio_send_queue_.clear();
+            gated_uplink_preroll_.clear();
+        } else if (flush_preroll) {
+            while (!gated_uplink_preroll_.empty()) {
+                if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                    audio_send_queue_.pop_front();
+                }
+                audio_send_queue_.push_back(std::move(gated_uplink_preroll_.front()));
+                gated_uplink_preroll_.pop_front();
+            }
+            notify_send_queue = !audio_send_queue_.empty();
+        } else {
+            gated_uplink_preroll_.clear();
+        }
+        audio_queue_cv_.notify_all();
+    }
+
+    if (notify_send_queue && callbacks_.on_send_queue_available) {
+        callbacks_.on_send_queue_available();
+    }
 }
 
 void AudioService::EncodeWakeWord() {
@@ -737,14 +1056,16 @@ void AudioService::EnableWakeWordDetection(bool enable) {
     }
 }
 
-void AudioService::EnableVoiceProcessing(bool enable) {
+void AudioService::EnableVoiceProcessing(bool enable, bool preserve_playback) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
         if (!InitializeAudioEngine()) {
             return;
         }
-        ResetDecoder();
+        if (!preserve_playback) {
+            ResetDecoder();
+        }
         audio_input_need_warmup_ = true;
         {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
@@ -814,6 +1135,81 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     demuxer->Process(buf, size);
 }
 
+void AudioService::PlayListenerFeedback(const std::string& feedback_id,
+                                        const std::string_view& ogg, float gain_db) {
+    if (feedback_id.empty() || ogg.empty()) {
+        return;
+    }
+    CancelListenerFeedback();
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        listener_feedback_playing_ = true;
+        listener_feedback_id_ = feedback_id;
+    }
+
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+
+    const auto* buf = reinterpret_cast<const uint8_t*>(ogg.data());
+    size_t size = ogg.size();
+    const float gain_linear = GainDbToLinear(gain_db);
+    auto demuxer = std::make_unique<OggDemuxer>();
+    demuxer->OnDemuxerFinished(
+        [this, feedback_id, gain_linear](const uint8_t* data, int sample_rate, size_t size) {
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->sample_rate = sample_rate;
+            packet->frame_duration = OPUS_FRAME_DURATION_MS;
+            packet->output_id = feedback_id;
+            packet->listener_feedback = true;
+            packet->gain_linear = gain_linear;
+            packet->payload.resize(size);
+            std::memcpy(packet->payload.data(), data, size);
+            PushPacketToDecodeQueue(std::move(packet), true);
+        });
+    demuxer->Reset();
+    demuxer->Process(buf, size);
+}
+
+void AudioService::CancelListenerFeedback() {
+    bool notify_drained = false;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (!listener_feedback_playing_) {
+            return;
+        }
+        ++playback_generation_;
+        const auto is_feedback = [](const auto& item) {
+            return item != nullptr && item->listener_feedback;
+        };
+        audio_decode_queue_.erase(
+            std::remove_if(audio_decode_queue_.begin(), audio_decode_queue_.end(), is_feedback),
+            audio_decode_queue_.end());
+        audio_playback_queue_.erase(
+            std::remove_if(audio_playback_queue_.begin(), audio_playback_queue_.end(), is_feedback),
+            audio_playback_queue_.end());
+        std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+        if (opus_decoder_ != nullptr) {
+            esp_opus_dec_reset(opus_decoder_);
+        }
+        decoder_lock.unlock();
+        listener_feedback_playing_ = false;
+        listener_feedback_id_.clear();
+        notify_drained = MarkPlaybackDrainedLocked();
+        audio_queue_cv_.notify_all();
+    }
+    if (notify_drained && callbacks_.on_playback_drained) {
+        callbacks_.on_playback_drained();
+    }
+}
+
+bool AudioService::IsListenerFeedbackPlaying() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return listener_feedback_playing_;
+}
+
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     return audio_encode_queue_.empty() && IsPlaybackDrainedLocked() && audio_testing_queue_.empty();
@@ -838,12 +1234,26 @@ void AudioService::ResetDecoder() {
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
         audio_testing_queue_.clear();
+        listener_feedback_playing_ = false;
+        listener_feedback_id_.clear();
+        decode_in_flight_listener_feedback_ = false;
+        remote_playback_paused_ = false;
+        playback_gain_linear_ = 1.0f;
         notify_drained = MarkPlaybackDrainedLocked();
         audio_queue_cv_.notify_all();
     }
     if (notify_drained && callbacks_.on_playback_drained) {
         callbacks_.on_playback_drained();
     }
+}
+
+void AudioService::ArmPlaybackMetric(uint32_t turn_id) {
+#if CONFIG_VOICE_LATENCY_METRICS
+    playback_metric_turn_id_.store(turn_id);
+    playback_metric_armed_.store(true);
+#else
+    (void)turn_id;
+#endif
 }
 
 bool AudioService::IsPlaybackDrainedLocked() const {
@@ -857,6 +1267,53 @@ bool AudioService::MarkPlaybackDrainedLocked() {
     }
     playback_drained_notified_ = true;
     return true;
+}
+
+int64_t AudioService::BufferedRemotePlaybackMsLocked(const std::string& output_id) const {
+    int64_t buffered_ms = 0;
+    for (const auto& packet : audio_decode_queue_) {
+        if (packet != nullptr && packet->output_id == output_id) {
+            buffered_ms += packet->frame_duration;
+        }
+    }
+    for (const auto& task : audio_playback_queue_) {
+        if (task != nullptr && task->output_id == output_id) {
+            buffered_ms += task->frame_duration_ms;
+        }
+    }
+    return buffered_ms;
+}
+
+bool AudioService::HasListenerFeedbackLocked() const {
+    if (decode_in_flight_listener_feedback_) {
+        return true;
+    }
+    for (const auto& packet : audio_decode_queue_) {
+        if (packet != nullptr && packet->listener_feedback) {
+            return true;
+        }
+    }
+    for (const auto& task : audio_playback_queue_) {
+        if (task != nullptr && task->listener_feedback) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float AudioService::GainDbToLinear(float gain_db) {
+    gain_db = std::clamp(gain_db, -60.0f, 0.0f);
+    return std::pow(10.0f, gain_db / 20.0f);
+}
+
+void AudioService::ApplyPcmGain(std::vector<int16_t>& pcm, float gain_linear) {
+    if (gain_linear >= 0.999f) {
+        return;
+    }
+    gain_linear = std::clamp(gain_linear, 0.0f, 1.0f);
+    for (auto& sample : pcm) {
+        sample = static_cast<int16_t>(std::lround(static_cast<float>(sample) * gain_linear));
+    }
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {

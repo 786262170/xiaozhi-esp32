@@ -750,6 +750,15 @@ choice DISPLAY_ESP32S3_KORVO2_V3
         bool "ILI9341 240*320"
 endchoice
 
+config ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+    bool "Enable ESP32-S3-Korvo-2 V3 ADC button diagnostics"
+    depends on BOARD_TYPE_ESP32_S3_KORVO_2_V3
+    default n
+    help
+        Periodically sample the shared ADC button channel and log raw ADC,
+        calibrated voltage, and the matched button range. This is intended
+        for hardware bring-up and should stay disabled in production builds.
+
 config ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
     bool "Use GPIO4 as an active-low handset hook switch"
     depends on BOARD_TYPE_ESP32_S3_KORVO_2_V3
@@ -942,6 +951,53 @@ config USE_WEBRTC
         Enable the LiveKit ESP32 client transport. OTA may prefer WebRTC and
         fall back to WebSocket or MQTT+UDP. The SDK is pinned because its
         pre-1.0 API may change between releases.
+
+config LOCAL_VAD_BARGE_IN
+    bool "Use Local VAD for Full-Duplex Barge-In"
+    default n
+    depends on USE_DEVICE_AEC
+    help
+        Keep the device AFE, AEC, and VAD running while the assistant is
+        speaking. Near-end speech immediately clears local playback and sends
+        an abort to the server after the initial playback guard. This is
+        transport-independent.
+
+config LOCAL_VAD_BARGE_IN_GUARD_MS
+    int "Initial Playback Guard for Local VAD Barge-In (ms)"
+    default 800
+    range 0 3000
+    depends on LOCAL_VAD_BARGE_IN
+    help
+        Ignore local VAD barge-in events for this many milliseconds after the
+        first assistant audio frame. This masks the strongest initial speaker
+        echo while preserving interruption later in the response.
+
+config VOICE_LATENCY_METRICS
+    bool "Enable Machine-Readable Voice Latency Events"
+    default n
+    help
+        Emit VOICE_METRIC serial log lines using esp_timer monotonic
+        milliseconds. The events contain no transcripts or raw audio.
+
+config DUPLEX_PLAYBACK_CONTROL
+    bool "Enable Server-Controlled Duplex Playback"
+    default n
+    depends on USE_DEVICE_AEC
+    help
+        Advertise playback_control_v1 and accept output-id scoped duck,
+        pause, resume, and cancel commands. The device also reports played
+        PCM duration so the server can distinguish sent audio from audio that
+        reached the speaker. Enable only on transports that keep AEC uplink
+        audio active while the assistant is speaking.
+
+config LISTENER_FEEDBACK
+    bool "Enable Local Non-Floor Listener Feedback"
+    default n
+    depends on DUPLEX_PLAYBACK_CONTROL
+    help
+        Advertise listener_feedback_v1 and play short embedded neutral
+        acknowledgements without changing the conversational device state or
+        closing microphone capture. Near-end voice cancels the feedback.
 
 config USE_AUDIO_DEBUGGER
     bool "Enable Audio Debugger"

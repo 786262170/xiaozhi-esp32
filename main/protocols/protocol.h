@@ -11,6 +11,9 @@ struct AudioStreamPacket {
     int sample_rate = 0;
     int frame_duration = 0;
     uint32_t timestamp = 0;
+    std::string output_id;
+    bool listener_feedback = false;
+    float gain_linear = 1.0f;
     std::vector<uint8_t> payload;
 };
 
@@ -65,6 +68,10 @@ public:
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual bool SendPhoneHangupRequest();
+    virtual bool SendPlaybackProgress(const std::string& output_id, int64_t played_ms,
+                                      int64_t buffered_ms, int64_t device_ts);
+    virtual bool SendPlaybackStopped(const std::string& output_id, int64_t played_ms,
+                                     const std::string& reason, int64_t device_ts);
     virtual void SendMcpMessage(const std::string& message);
 
 protected:

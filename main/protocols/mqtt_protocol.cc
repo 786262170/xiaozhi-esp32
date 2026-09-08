@@ -360,6 +360,12 @@ std::string MqttProtocol::GetHelloMessage() {
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
     cJSON_AddBoolToObject(features, "phone_hangup", true);
+#if CONFIG_DUPLEX_PLAYBACK_CONTROL
+    cJSON_AddBoolToObject(features, "playback_control_v1", true);
+#endif
+#if CONFIG_LISTENER_FEEDBACK
+    cJSON_AddBoolToObject(features, "listener_feedback_v1", true);
+#endif
     cJSON_AddItemToObject(root, "features", features);
     AddTextFontCapabilities(root);
     cJSON* audio_params = cJSON_CreateObject();

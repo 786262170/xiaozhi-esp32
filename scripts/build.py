@@ -9,6 +9,7 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 # Switch to project root directory
 os.chdir(Path(__file__).resolve().parent.parent)
@@ -197,6 +198,21 @@ def _language_sdkconfig_option(language: str) -> tuple[str, str]:
     normalized = _normalize_language(language)
     symbol = normalized.replace("-", "_").upper()
     return normalized, f"CONFIG_LANGUAGE_{symbol}=y"
+
+
+def _ota_url_sdkconfig_option(ota_url: str) -> str:
+    """Validate and encode the firmware's default OTA URL."""
+    value = ota_url.strip()
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or '"' in value
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ValueError(f"Invalid OTA URL {ota_url!r}")
+    return f'CONFIG_OTA_URL="{value}"'
 
 
 def _collect_wake_words(
@@ -894,6 +910,7 @@ def build_board(
     create_zip: bool = False,
     language: Optional[str] = None,
     wake_word: Optional[str] = None,
+    ota_url: Optional[str] = None,
     idf_version: tuple[int, int, int] = (6, 0, 0),
 ) -> None:
     """Compile one specified variant of the specified board type.
@@ -905,6 +922,7 @@ def build_board(
         create_zip: package merged-binary.bin under releases/ when true
         language: optional locale such as en-US
         wake_word: optional ESP-SR model name or "disabled"
+        ota_url: optional HTTP(S) endpoint used for device bootstrap
     """
     cfg_path = _BOARDS_DIR / Path(board_type) / config_filename
     if not cfg_path.exists():
@@ -972,6 +990,8 @@ def build_board(
             ) = _wake_word_sdkconfig_options(wake_word, target)
             user_options.extend(wake_word_options)
             validation_symbols.append((wake_word_symbols, "--wake-word"))
+        if ota_url is not None:
+            user_options.append(_ota_url_sdkconfig_option(ota_url))
 
         sdkconfig_append = _merge_sdkconfig_options(
             sdkconfig_append,
@@ -1102,6 +1122,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         ),
     )
     parser.add_argument(
+        "--ota-url",
+        metavar="URL",
+        help="Default HTTP(S) OTA endpoint compiled into the firmware",
+    )
+    parser.add_argument(
         "--zip",
         action="store_true",
         help="Also recreate releases/v<version>_<name>.zip",
@@ -1127,6 +1152,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.zip
             or args.json
         ):
@@ -1145,6 +1171,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.zip
         ):
             parser.error(
@@ -1165,6 +1192,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.zip
         ):
             parser.error(
@@ -1192,6 +1220,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
         ):
             parser.error(
                 "--list-boards cannot be combined with build or other "
@@ -1258,6 +1287,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             create_zip=args.zip,
             language=args.language,
             wake_word=args.wake_word,
+            ota_url=args.ota_url,
             idf_version=idf_version,
         )
 

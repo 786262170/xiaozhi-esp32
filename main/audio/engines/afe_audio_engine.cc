@@ -133,12 +133,31 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
     }
 
     afe_config->aec_init = codec_->input_reference();
+#if CONFIG_LOCAL_VAD_BARGE_IN
+    // Local barge-in keeps the microphone active during TTS. Use the
+    // full-duplex AEC profile and require a longer, more confident speech
+    // segment so playback residue does not abort the assistant by itself.
+    afe_config->aec_mode = AEC_MODE_FD_HIGH_PERF;
+#else
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
+#endif
     afe_config->aec_nlp_level = AEC_NLP_LEVEL_VERYAGGR;
     afe_config->ns_init = false;
     afe_config->vad_init = kUseAfeForVoiceProcessing;
+#if CONFIG_LOCAL_VAD_BARGE_IN
+    // VADNet mode numbers increase trigger probability. Use its most
+    // conservative mode so residual TTS is not treated as near-end speech.
+#if CONFIG_SR_VADN_VADNET1_MEDIUM
+    afe_config->vad_mode = VAD_MODE_0;
+#else
+    afe_config->vad_mode = VAD_MODE_2;
+#endif
+    afe_config->vad_min_speech_ms = 256;
+    afe_config->vad_min_noise_ms = 300;
+#else
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_min_noise_ms = 100;
+#endif
     if (vad_model_name != nullptr) {
         afe_config->vad_model_name = vad_model_name;
     }

@@ -20,6 +20,7 @@ public:
     bool HasMqttConfig() { return has_mqtt_config_; }
     bool HasWebsocketConfig() { return has_websocket_config_; }
     bool HasWebRTCConfig() { return has_webrtc_config_; }
+    bool HasCachedProtocolConfig() { return has_cached_protocol_config_; }
     bool HasActivationCode() { return has_activation_code_; }
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
@@ -46,6 +47,7 @@ private:
     bool has_activation_code_ = false;
     bool has_serial_number_ = false;
     bool has_activation_challenge_ = false;
+    bool has_cached_protocol_config_ = false;
     std::string current_version_;
     std::string firmware_version_;
     std::string firmware_url_;

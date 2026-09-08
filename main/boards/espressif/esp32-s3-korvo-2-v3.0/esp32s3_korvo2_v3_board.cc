@@ -1,20 +1,38 @@
+#ifdef KORVO2_ML307_BOARD
+#include "ml307_board.h"
+using Korvo2NetworkBoard = Ml307Board;
+#elif defined(KORVO2_CLM920_RNDIS_BOARD)
+#include "rndis_board.h"
+using Korvo2NetworkBoard = RndisBoard;
+#else
 #include "wifi_board.h"
-#include "codecs/box_audio_codec.h"
-#include "display/lcd_display.h"
+using Korvo2NetworkBoard = WifiBoard;
+#endif
 #include "application.h"
-#include "button.h"
-#include "config.h"
-#include "i2c_device.h"
 #include "assets/lang_config.h"
+#include "button.h"
+#include "codecs/box_audio_codec.h"
+#include "config.h"
+#include "display/lcd_display.h"
+#include "i2c_device.h"
 #include "settings.h"
 
-#include <esp_log.h>
-#include <esp_timer.h>
-#include <esp_lcd_panel_vendor.h>
-#include <esp_io_expander_tca9554.h>
-#include <esp_lcd_ili9341.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <esp_io_expander_tca9554.h>
+#include <esp_lcd_ili9341.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#ifdef KORVO2_ML307_BOARD
+#include <driver/uart.h>
+#include <hal/usb_serial_jtag_ll.h>
+#include <hal/usb_wrap_ll.h>
+#endif
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "esp32_camera.h"
 #include "power_manager.h"
 #include "power_save_timer.h"
@@ -41,28 +59,45 @@ typedef enum {
     BSP_ADC_BUTTON_NUM
 } bsp_adc_button_t;
 
-// Init ili9341 by custom cmd
-static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
-    {0xC8, (uint8_t []){0xFF, 0x93, 0x42}, 3, 0},
-    {0xC0, (uint8_t []){0x0E, 0x0E}, 2, 0},
-    {0xC5, (uint8_t []){0xD0}, 1, 0},
-    {0xC1, (uint8_t []){0x02}, 1, 0},
-    {0xB4, (uint8_t []){0x02}, 1, 0},
-    {0xE0, (uint8_t []){0x00, 0x03, 0x08, 0x06, 0x13, 0x09, 0x39, 0x39, 0x48, 0x02, 0x0a, 0x08, 0x17, 0x17, 0x0F}, 15, 0},
-    {0xE1, (uint8_t []){0x00, 0x28, 0x29, 0x01, 0x0d, 0x03, 0x3f, 0x33, 0x52, 0x04, 0x0f, 0x0e, 0x37, 0x38, 0x0F}, 15, 0},
+typedef struct {
+    int min_mv;
+    int max_mv;
+    const char* name;
+} bsp_adc_button_range_t;
 
-    {0xB1, (uint8_t []){00, 0x1B}, 2, 0},
-    {0x36, (uint8_t []){0x08}, 1, 0},
-    {0x3A, (uint8_t []){0x55}, 1, 0},
-    {0xB7, (uint8_t []){0x06}, 1, 0},
-
-    {0x11, (uint8_t []){0}, 0x80, 0},
-    {0x29, (uint8_t []){0}, 0x80, 0},
-
-    {0, (uint8_t []){0}, 0xff, 0},
+static constexpr bsp_adc_button_range_t kAdcButtonRanges[BSP_ADC_BUTTON_NUM] = {
+    {2310, 2510, "REC"}, {1880, 2080, "MUTE"}, {1550, 1750, "PLAY"},
+    {1015, 1215, "SET"}, {720, 920, "VOL-"},   {280, 480, "VOL+"},
 };
 
-class Esp32S3Korvo2V3Board : public WifiBoard {
+// Init ili9341 by custom cmd
+static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
+    {0xC8, (uint8_t[]){0xFF, 0x93, 0x42}, 3, 0},
+    {0xC0, (uint8_t[]){0x0E, 0x0E}, 2, 0},
+    {0xC5, (uint8_t[]){0xD0}, 1, 0},
+    {0xC1, (uint8_t[]){0x02}, 1, 0},
+    {0xB4, (uint8_t[]){0x02}, 1, 0},
+    {0xE0,
+     (uint8_t[]){0x00, 0x03, 0x08, 0x06, 0x13, 0x09, 0x39, 0x39, 0x48, 0x02, 0x0a, 0x08, 0x17, 0x17,
+                 0x0F},
+     15, 0},
+    {0xE1,
+     (uint8_t[]){0x00, 0x28, 0x29, 0x01, 0x0d, 0x03, 0x3f, 0x33, 0x52, 0x04, 0x0f, 0x0e, 0x37, 0x38,
+                 0x0F},
+     15, 0},
+
+    {0xB1, (uint8_t[]){00, 0x1B}, 2, 0},
+    {0x36, (uint8_t[]){0x08}, 1, 0},
+    {0x3A, (uint8_t[]){0x55}, 1, 0},
+    {0xB7, (uint8_t[]){0x06}, 1, 0},
+
+    {0x11, (uint8_t[]){0}, 0x80, 0},
+    {0x29, (uint8_t[]){0}, 0x80, 0},
+
+    {0, (uint8_t[]){0}, 0xff, 0},
+};
+
+class Esp32S3Korvo2V3Board : public Korvo2NetworkBoard {
 private:
     Button boot_button_;
 #if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
@@ -86,25 +121,245 @@ private:
         if (settings.GetBool(kStoryPhoneVolumeMigrationKey, false)) {
             return;
         }
+
         settings.SetInt("output_volume", kStoryPhoneDefaultVolume);
         settings.SetBool(kStoryPhoneVolumeMigrationKey, true);
-        ESP_LOGI(TAG, "Story phone output volume initialized to %d", kStoryPhoneDefaultVolume);
+        ESP_LOGI(TAG, "Story phone output volume initialized to %d (one-time migration)",
+                 kStoryPhoneDefaultVolume);
     }
+
+#ifdef KORVO2_ML307_BOARD
+    struct Ml307ProbePins {
+        gpio_num_t tx;
+        gpio_num_t rx;
+    };
+
+    void ReleaseUsbPadsForMl307() {
+        // GPIO19/20 are also the ESP32-S3 native USB D-/D+ pads.  The ML307
+        // variant uses them as UART pins, so release both USB controllers
+        // explicitly before installing the UART driver.
+        usb_serial_jtag_ll_phy_enable_pad(false);
+        usb_wrap_ll_phy_disable_pull_override(&USB_WRAP);
+        usb_wrap_ll_phy_enable_pad(&USB_WRAP, false);
+        gpio_reset_pin(ML307_TX_PIN);
+        gpio_reset_pin(ML307_RX_PIN);
+    }
+
+    bool ProbeMl307AtDirection(const Ml307ProbePins& pins, int& detected_baud,
+                               int& received_bytes) {
+        static constexpr int kProbeBaudRates[] = {
+            115200, 921600, 460800, 230400, 57600, 38400, 19200, 9600,
+        };
+        static constexpr char kAtCommand[] = "AT\r\n";
+
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            uart_set_pin(UART_NUM_1, pins.tx, pins.rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+        gpio_set_pull_mode(pins.rx, GPIO_PULLUP_ONLY);
+
+        for (int baud : kProbeBaudRates) {
+            uart_set_baudrate(UART_NUM_1, baud);
+            uart_flush_input(UART_NUM_1);
+            uart_write_bytes(UART_NUM_1, kAtCommand, sizeof(kAtCommand) - 1);
+            uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+
+            std::string response;
+            TickType_t start = xTaskGetTickCount();
+            while (xTaskGetTickCount() - start < pdMS_TO_TICKS(300)) {
+                uint8_t buffer[64];
+                int length = uart_read_bytes(UART_NUM_1, buffer, sizeof(buffer), pdMS_TO_TICKS(50));
+                if (length > 0) {
+                    response.append(reinterpret_cast<const char*>(buffer), length);
+                    if (response.find("OK") != std::string::npos) {
+                        break;
+                    }
+                }
+            }
+
+            received_bytes = static_cast<int>(response.size());
+            char status[64];
+            snprintf(status, sizeof(status), "ML307 AT %d>%d %d RX=%d", static_cast<int>(pins.tx),
+                     static_cast<int>(pins.rx), baud, received_bytes);
+            display_->SetStatus(status);
+            ESP_LOGI(TAG, "%s", status);
+
+            if (response.find("OK") != std::string::npos) {
+                detected_baud = baud;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ProbeMl307At(int& detected_baud, int& received_bytes) {
+        const uart_config_t uart_config = {
+            .baud_rate = 115200,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .rx_flow_ctrl_thresh = 0,
+            .source_clk = UART_SCLK_DEFAULT,
+            .flags = {},
+        };
+
+        esp_err_t result = uart_param_config(UART_NUM_1, &uart_config);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "ML307 probe UART config failed: %s", esp_err_to_name(result));
+            return false;
+        }
+        result = uart_driver_install(UART_NUM_1, 1024, 0, 0, nullptr, 0);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "ML307 probe UART install failed: %s", esp_err_to_name(result));
+            return false;
+        }
+
+        static constexpr Ml307ProbePins kProbeDirections[] = {
+            {ML307_TX_PIN, ML307_RX_PIN},
+            {ML307_RX_PIN, ML307_TX_PIN},
+        };
+
+        bool found = false;
+        for (const auto& pins : kProbeDirections) {
+            if (ProbeMl307AtDirection(pins, detected_baud, received_bytes)) {
+                tx_pin_ = pins.tx;
+                rx_pin_ = pins.rx;
+                found = true;
+                break;
+            }
+        }
+
+        if (found && detected_baud != 921600) {
+            static constexpr char kSetBaudCommand[] = "AT+IPR=921600\r\n";
+            uart_write_bytes(UART_NUM_1, kSetBaudCommand, sizeof(kSetBaudCommand) - 1);
+            uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        uart_driver_delete(UART_NUM_1);
+        return found;
+    }
+
+    static void Ml307ProbeTask(void* arg) {
+        auto* board = static_cast<Esp32S3Korvo2V3Board*>(arg);
+        int attempt = 0;
+        while (true) {
+            ++attempt;
+            int detected_baud = 0;
+            int received_bytes = 0;
+            board->ReleaseUsbPadsForMl307();
+            if (board->ProbeMl307At(detected_baud, received_bytes)) {
+                char status[64];
+                snprintf(status, sizeof(status), "ML307 AT OK %d>%d %d",
+                         static_cast<int>(board->tx_pin_), static_cast<int>(board->rx_pin_),
+                         detected_baud);
+                board->display_->SetStatus(status);
+                ESP_LOGI(TAG, "%s", status);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                board->Korvo2NetworkBoard::StartNetwork();
+                vTaskDelete(nullptr);
+                return;
+            }
+
+            char status[64];
+            snprintf(status, sizeof(status), "ML307 NO AT #%d RX=%d", attempt, received_bytes);
+            board->display_->SetStatus(status);
+            ESP_LOGW(TAG, "%s", status);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+#endif
+
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+    static int MatchAdcButton(int voltage_mv) {
+        for (int i = 0; i < BSP_ADC_BUTTON_NUM; ++i) {
+            if (voltage_mv >= kAdcButtonRanges[i].min_mv &&
+                voltage_mv <= kAdcButtonRanges[i].max_mv) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    static void AdcButtonDiagnosticTask(void* arg) {
+        auto* board = static_cast<Esp32S3Korvo2V3Board*>(arg);
+        adc_cali_handle_t calibration_handle = nullptr;
+        const adc_cali_curve_fitting_config_t calibration_config = {
+            .unit_id = ADC_UNIT_1,
+            .chan = ADC_CHANNEL_4,
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_12,
+        };
+        esp_err_t calibration_result =
+            adc_cali_create_scheme_curve_fitting(&calibration_config, &calibration_handle);
+        if (calibration_result != ESP_OK) {
+            ESP_LOGW(TAG, "ADC button diagnostics has no calibration: %s",
+                     esp_err_to_name(calibration_result));
+        }
+
+        ESP_LOGI(TAG,
+                 "ADC button diagnostics enabled on GPIO5/ADC1_CH4; "
+                 "REC expected at 2310-2510mV");
+
+        int last_raw = -1;
+        int last_button = -2;
+        TickType_t last_log_tick = 0;
+        while (true) {
+            int raw = 0;
+            esp_err_t read_result = adc_oneshot_read(board->bsp_adc_handle, ADC_CHANNEL_4, &raw);
+            if (read_result != ESP_OK) {
+                if (read_result != ESP_ERR_TIMEOUT) {
+                    ESP_LOGW(TAG, "ADC button diagnostic read failed: %s",
+                             esp_err_to_name(read_result));
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
+            int voltage_mv = -1;
+            int matched_button = -1;
+            if (calibration_handle != nullptr &&
+                adc_cali_raw_to_voltage(calibration_handle, raw, &voltage_mv) == ESP_OK) {
+                matched_button = MatchAdcButton(voltage_mv);
+            }
+
+            TickType_t now = xTaskGetTickCount();
+            int raw_delta = last_raw < 0 ? 0 : (raw > last_raw ? raw - last_raw : last_raw - raw);
+            bool state_changed = matched_button != last_button;
+            bool raw_changed = last_raw >= 0 && raw_delta >= 160;
+            bool heartbeat_due = last_log_tick == 0 || now - last_log_tick >= pdMS_TO_TICKS(15000);
+            if (state_changed || raw_changed || heartbeat_due) {
+                const char* button_name =
+                    matched_button >= 0 ? kAdcButtonRanges[matched_button].name : "NONE";
+                ESP_LOGI(TAG, "ADC button sample: raw=%d, voltage=%dmV, matched=%s", raw,
+                         voltage_mv, button_name);
+                last_raw = raw;
+                last_button = matched_button;
+                last_log_tick = now;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    void InitializeAdcButtonDiagnostics() {
+        BaseType_t result =
+            xTaskCreate(AdcButtonDiagnosticTask, "adc_button_diag", 3072, this, 2, nullptr);
+        if (result != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start ADC button diagnostic task");
+        }
+    }
+#endif
 
     void InitializePowerManager() {
         // PowerManager需要复用按钮的ADC句柄，所以在InitializeButtons之后调用
         // 传入按钮的ADC句柄指针，让PowerManager复用
         power_manager_ = new PowerManager(GPIO_NUM_NC, &bsp_adc_handle);
     }
-    
+
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60);
-        power_save_timer_->OnEnterSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(true);
-        });
-        power_save_timer_->OnExitSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(false);
-        });
+        power_save_timer_->OnEnterSleepMode([this]() { GetDisplay()->SetPowerSaveMode(true); });
+        power_save_timer_->OnExitSleepMode([this]() { GetDisplay()->SetPowerSaveMode(false); });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -118,9 +373,10 @@ private:
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
             .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
@@ -147,34 +403,39 @@ private:
     }
 
     void InitializeTca9554() {
-        esp_err_t ret = esp_io_expander_new_i2c_tca9554(i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000, &io_expander_);
-        if(ret != ESP_OK) {
-            ret = esp_io_expander_new_i2c_tca9554(i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9554A_ADDRESS_000, &io_expander_);
-            if(ret != ESP_OK) {
-                ESP_LOGE(TAG, "TCA9554 create returned error");  
+        esp_err_t ret = esp_io_expander_new_i2c_tca9554(
+            i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000, &io_expander_);
+        if (ret != ESP_OK) {
+            ret = esp_io_expander_new_i2c_tca9554(
+                i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9554A_ADDRESS_000, &io_expander_);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "TCA9554 create returned error");
                 return;
             }
         }
         // 配置IO0-IO3为输出模式
-        ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander_, 
-            IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | 
-            IO_EXPANDER_PIN_NUM_2 | IO_EXPANDER_PIN_NUM_3, 
-            IO_EXPANDER_OUTPUT));
+        ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander_,
+                                                IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 |
+                                                    IO_EXPANDER_PIN_NUM_2 | IO_EXPANDER_PIN_NUM_3,
+                                                IO_EXPANDER_OUTPUT));
 
         // 复位LCD和TouchPad
-        ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander_,
-            IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2, 1));
+        ESP_ERROR_CHECK(esp_io_expander_set_level(
+            io_expander_, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2,
+            1));
         vTaskDelay(pdMS_TO_TICKS(300));
-        ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander_,
-            IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2, 0));
+        ESP_ERROR_CHECK(esp_io_expander_set_level(
+            io_expander_, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2,
+            0));
         vTaskDelay(pdMS_TO_TICKS(300));
-        ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander_,
-            IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2, 1));
+        ESP_ERROR_CHECK(esp_io_expander_set_level(
+            io_expander_, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2,
+            1));
     }
 
     void EnableLcdCs() {
-        if(io_expander_ != NULL) {
-            esp_io_expander_set_level(io_expander_, IO_EXPANDER_PIN_NUM_3, 0);// 置低 LCD CS
+        if (io_expander_ != NULL) {
+            esp_io_expander_set_level(io_expander_, IO_EXPANDER_PIN_NUM_3, 0);  // 置低 LCD CS
         }
     }
 
@@ -207,7 +468,7 @@ private:
         auto volume = codec->output_volume();
         if (volume > 1) {
             volume = 0;
-        } else  {
+        } else {
             volume = 50;
         }
         codec->SetOutputVolume(volume);
@@ -225,6 +486,7 @@ private:
             handset_hook_armed_.store(true);
             ESP_LOGI(TAG, "Handset hook armed after stable on-hook state");
         }
+
         ESP_LOGI(TAG, "Handset hook stable: %s", off_hook ? "off-hook" : "on-hook");
         Application::GetInstance().SetPhoneHookState(off_hook);
     }
@@ -268,8 +530,8 @@ private:
 #endif
 
     void InitializeButtons() {
-         button_adc_config_t adc_cfg = {};
-        adc_cfg.adc_channel = ADC_CHANNEL_4; // ADC1 channel 0 is GPIO5
+        button_adc_config_t adc_cfg = {};
+        adc_cfg.adc_channel = ADC_CHANNEL_4;  // ADC1 channel 0 is GPIO5
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
         const adc_oneshot_unit_init_cfg_t init_config1 = {
             .unit_id = ADC_UNIT_1,
@@ -277,66 +539,44 @@ private:
         adc_oneshot_new_unit(&init_config1, &bsp_adc_handle);
         adc_cfg.adc_handle = &bsp_adc_handle;
 #endif
-        adc_cfg.button_index = BSP_ADC_BUTTON_REC;
-        adc_cfg.min = 2310; // middle is 2410mV
-        adc_cfg.max = 2510;
-        adc_button_[0] = new AdcButton(adc_cfg);
-
-        adc_cfg.button_index = BSP_ADC_BUTTON_VOL_MUTE;
-        adc_cfg.min = 1880; // middle is 1980mV
-        adc_cfg.max = 2080;
-        adc_button_[1] = new AdcButton(adc_cfg);
-
-        adc_cfg.button_index = BSP_ADC_BUTTON_PLAY;
-        adc_cfg.min = 1550; // middle is 1650mV
-        adc_cfg.max = 1750;
-        adc_button_[2] = new AdcButton(adc_cfg);
-
-        adc_cfg.button_index = BSP_ADC_BUTTON_SET;
-        adc_cfg.min = 1015; // middle is 1115mV
-        adc_cfg.max = 1215;
-        adc_button_[3] = new AdcButton(adc_cfg);
-
-        adc_cfg.button_index = BSP_ADC_BUTTON_VOL_DOWN;
-        adc_cfg.min = 720; // middle is 820mV
-        adc_cfg.max = 920;
-        adc_button_[4] = new AdcButton(adc_cfg);
-
-        adc_cfg.button_index = BSP_ADC_BUTTON_VOL_UP;
-        adc_cfg.min = 280; // middle is 380mV
-        adc_cfg.max = 480;
-        adc_button_[5] = new AdcButton(adc_cfg);
+        for (int i = 0; i < BSP_ADC_BUTTON_NUM; ++i) {
+            adc_cfg.button_index = i;
+            adc_cfg.min = kAdcButtonRanges[i].min_mv;
+            adc_cfg.max = kAdcButtonRanges[i].max_mv;
+            adc_button_[i] = new AdcButton(adc_cfg);
+        }
 
         auto volume_up_button = adc_button_[BSP_ADC_BUTTON_VOL_UP];
-        volume_up_button->OnClick([this]() {ChangeVol(10);});
+        volume_up_button->OnClick([this]() { ChangeVol(10); });
         volume_up_button->OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
 
         auto volume_down_button = adc_button_[BSP_ADC_BUTTON_VOL_DOWN];
-        volume_down_button->OnClick([this]() {ChangeVol(-10);});
+        volume_down_button->OnClick([this]() { ChangeVol(-10); });
         volume_down_button->OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(0);
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
 
         auto volume_mute_button = adc_button_[BSP_ADC_BUTTON_VOL_MUTE];
-        volume_mute_button->OnClick([this]() {MuteVol();});
+        volume_mute_button->OnClick([this]() { MuteVol(); });
 
         auto play_button = adc_button_[BSP_ADC_BUTTON_PLAY];
-        play_button->OnClick([this]() {
-             ESP_LOGI(TAG, " TODO %s:%d\n", __func__, __LINE__);
-        });
+        play_button->OnClick([this]() { ESP_LOGI(TAG, " TODO %s:%d\n", __func__, __LINE__); });
 
         auto set_button = adc_button_[BSP_ADC_BUTTON_SET];
         set_button->OnClick([this]() {
+#if !defined(KORVO2_ML307_BOARD) && !defined(KORVO2_CLM920_RNDIS_BOARD)
             EnterWifiConfigMode();
+#endif
         });
 
         auto rec_button = adc_button_[BSP_ADC_BUTTON_REC];
         rec_button->OnClick([this]() {
-             Application::GetInstance().TogglePhoneChatState();
+            ESP_LOGI(TAG, "REC button click detected; toggling phone chat state");
+            Application::GetInstance().TogglePhoneChatState();
         });
 #if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
         InitializeHandsetHookSwitch();
@@ -345,7 +585,9 @@ private:
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
+#if !defined(KORVO2_ML307_BOARD) && !defined(KORVO2_CLM920_RNDIS_BOARD)
                 EnterWifiConfigMode();
+#endif
                 return;
             }
             app.ToggleChatState();
@@ -389,9 +631,9 @@ private:
         // panel_config.flags.reset_active_high = 0,
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void *)&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(panel_io, &panel_config, &panel));
-        
+
         ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
         EnableLcdCs();
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
@@ -399,8 +641,9 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, false));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeSt7789Display() {
@@ -432,8 +675,9 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
 
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeCamera() {
@@ -441,7 +685,7 @@ private:
             .pin_pwdn = CAMERA_PIN_PWDN,
             .pin_reset = CAMERA_PIN_RESET,
             .pin_xclk = CAMERA_PIN_XCLK,
-            .pin_sccb_sda = -1, // Use initialized I2C
+            .pin_sccb_sda = -1,  // Use initialized I2C
             .pin_sccb_scl = -1,
             .pin_d7 = CAMERA_PIN_D7,
             .pin_d6 = CAMERA_PIN_D6,
@@ -469,13 +713,22 @@ private:
         };
 
         camera_ = new Esp32Camera(camera_config);
-        if(camera_ != nullptr) {
+        if (camera_ != nullptr) {
             camera_->SetVFlip(true);
         }
     }
 
 public:
+#ifdef KORVO2_ML307_BOARD
+    Esp32S3Korvo2V3Board()
+        : Korvo2NetworkBoard(ML307_TX_PIN, ML307_RX_PIN), boot_button_(BOOT_BUTTON_GPIO) {
+#elif defined(KORVO2_CLM920_RNDIS_BOARD)
+    Esp32S3Korvo2V3Board()
+        : Korvo2NetworkBoard(CLM920_USB_VENDOR_ID, CLM920_USB_PRODUCT_ID),
+          boot_button_(BOOT_BUTTON_GPIO){
+#else
     Esp32S3Korvo2V3Board() : boot_button_(BOOT_BUTTON_GPIO) {
+#endif
         ESP_LOGI(TAG, "Initializing esp32s3_korvo2_v3 Board");
         InitializeStoryPhoneDefaultVolume();
         InitializePowerSaveTimer();
@@ -484,38 +737,39 @@ public:
         InitializeTca9554();
         InitializeCamera();
         InitializeSpi();
-        InitializeButtons();  // 先初始化按钮（创建ADC1句柄）
+        InitializeButtons();       // 先初始化按钮（创建ADC1句柄）
         InitializePowerManager();  // 后初始化PowerManager（复用ADC1句柄）
-        #ifdef LCD_TYPE_ILI9341_SERIAL
-        InitializeIli9341Display(); 
-        #else
-        InitializeSt7789Display(); 
-        #endif
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+        InitializeAdcButtonDiagnostics();
+#endif
+#ifdef LCD_TYPE_ILI9341_SERIAL
+        InitializeIli9341Display();
+#else
+    InitializeSt7789Display();
+#endif
     }
 
     virtual AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(
-            i2c_bus_, 
-            AUDIO_INPUT_SAMPLE_RATE, 
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, 
-            AUDIO_I2S_GPIO_BCLK, 
-            AUDIO_I2S_GPIO_WS, 
-            AUDIO_I2S_GPIO_DOUT, 
-            AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, 
-            AUDIO_CODEC_ES8311_ADDR, 
-            AUDIO_CODEC_ES7210_ADDR, 
+            i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
             AUDIO_INPUT_REFERENCE, 30.0f, AUDIO_INPUT_REFERENCE_GAIN_CHANNEL, 0.0f);
         return &audio_codec;
     }
 
-    virtual Display *GetDisplay() override {
-        return display_;
+    virtual Display* GetDisplay() override { return display_; }
+#ifdef KORVO2_ML307_BOARD
+    virtual void StartNetwork() override {
+        OnNetworkEvent(NetworkEvent::ModemDetecting);
+        BaseType_t result = xTaskCreate(Ml307ProbeTask, "ml307_probe", 4096, this, 5, nullptr);
+        if (result != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start ML307 probe task");
+            OnNetworkEvent(NetworkEvent::ModemErrorInitFailed);
+        }
     }
-    virtual Camera* GetCamera() override {
-        return camera_;
-    }
+#endif
+    virtual Camera* GetCamera() override { return camera_; }
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         static bool last_discharging = false;
         charging = power_manager_->IsCharging();
@@ -532,7 +786,7 @@ public:
         if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
-        WifiBoard::SetPowerSaveLevel(level);
+        Korvo2NetworkBoard::SetPowerSaveLevel(level);
     }
 };
 

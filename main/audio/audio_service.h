@@ -42,6 +42,7 @@
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#define GATED_UPLINK_PREROLL_PACKETS (900 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
 
@@ -87,6 +88,17 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_audio_testing_queue_full;
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
+    std::function<void(const std::string& output_id, int64_t played_ms,
+                       int64_t buffered_ms, int64_t device_ts)> on_playback_progress;
+    std::function<void(const std::string& output_id, int64_t played_ms,
+                       const std::string& reason, int64_t device_ts)> on_playback_stopped;
+};
+
+enum class RemotePlaybackAction {
+    kDuck,
+    kPause,
+    kResume,
+    kCancel,
 };
 
 enum AudioTaskType {
@@ -99,6 +111,10 @@ struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    int frame_duration_ms = OPUS_FRAME_DURATION_MS;
+    std::string output_id;
+    bool listener_feedback = false;
+    float gain_linear = 1.0f;
 };
 
 struct DebugStatistics {
@@ -132,7 +148,8 @@ public:
     bool IsAfeWakeWord();
 
     void EnableWakeWordDetection(bool enable);
-    void EnableVoiceProcessing(bool enable);
+    void EnableVoiceProcessing(bool enable, bool preserve_playback = false);
+    void SetUplinkAudioEnabled(bool enabled, bool flush_preroll = true);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
@@ -140,6 +157,8 @@ public:
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm);
+    bool PushRemotePacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet,
+                                       const std::string& output_id);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void EnableExternalPcmCapture(bool enable);
     bool ReadExternalPcm(int16_t* samples, size_t sample_count, int timeout_ms);
@@ -147,8 +166,18 @@ public:
         return codec_ == nullptr ? 16000 : codec_->output_sample_rate();
     }
     void PlaySound(const std::string_view& sound);
+    void PlayListenerFeedback(const std::string& feedback_id, const std::string_view& sound,
+                              float gain_db = -9.0f);
+    void CancelListenerFeedback();
+    bool IsListenerFeedbackPlaying();
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
+    void BeginRemotePlayback(const std::string& output_id);
+    void EndRemotePlayback(const std::string& output_id, const std::string& reason);
+    bool ControlRemotePlayback(const std::string& output_id, RemotePlaybackAction action,
+                               float target_gain_db = 0.0f);
+    void CompleteRemotePlaybackIfDrained();
+    void ArmPlaybackMetric(uint32_t turn_id);
     void SetModelsList(srmodel_list_t* models_list);
 
 private:
@@ -185,13 +214,24 @@ private:
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> gated_uplink_preroll_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
     bool decode_in_flight_ = false;
+    bool decode_in_flight_listener_feedback_ = false;
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
+    std::string remote_output_id_;
+    int64_t remote_played_ms_ = 0;
+    int64_t remote_last_reported_ms_ = 0;
+    bool remote_stop_pending_ = false;
+    std::string remote_stop_reason_;
+    float playback_gain_linear_ = 1.0f;
+    bool remote_playback_paused_ = false;
+    bool listener_feedback_playing_ = false;
+    std::string listener_feedback_id_;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -212,6 +252,11 @@ private:
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> audio_input_need_warmup_{false};
+    std::atomic<bool> uplink_audio_enabled_{true};
+#if CONFIG_VOICE_LATENCY_METRICS
+    std::atomic<bool> playback_metric_armed_{false};
+    std::atomic<uint32_t> playback_metric_turn_id_{0};
+#endif
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
@@ -226,6 +271,10 @@ private:
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
+    int64_t BufferedRemotePlaybackMsLocked(const std::string& output_id) const;
+    bool HasListenerFeedbackLocked() const;
+    static float GainDbToLinear(float gain_db);
+    static void ApplyPcmGain(std::vector<int16_t>& pcm, float gain_linear);
 };
 
 #endif

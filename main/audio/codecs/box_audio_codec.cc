@@ -14,6 +14,12 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     duplex_ = true;                              // 是否双工
     input_reference_ = input_reference;          // 是否使用参考输入，实现回声消除
     input_channels_ = input_reference_ ? 2 : 1;  // 输入通道数
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+    // Bring-up builds expose every ES7210 TDM slot so the physical microphone
+    // wiring can be identified without changing production channel routing.
+    input_reference_ = false;
+    input_channels_ = 4;
+#endif
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     input_gain_ = input_gain;
@@ -203,10 +209,20 @@ void BoxAudioCodec::EnableInput(bool enable) {
             .sample_rate = (uint32_t)output_sample_rate_,
             .mclk_multiple = 0,
         };
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+        fs.channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) |
+                          ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1) |
+                          ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) |
+                          ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3);
+#else
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
+#endif
         ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+#if CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, fs.channel_mask, input_gain_));
+#else
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
             input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
         if (input_reference_ && reference_gain_channel_ >= 0) {
@@ -216,6 +232,7 @@ void BoxAudioCodec::EnableInput(bool enable) {
                 input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(reference_gain_channel_),
                 reference_gain_));
         }
+#endif
     } else {
         ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
     }

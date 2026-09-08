@@ -12,6 +12,49 @@
                 "CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096",
                 "CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4=y"
             ]
+        },
+        {
+            "name": "esp32s3-korvo2-v3-aec-diagnostic",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_USE_SERVER_AEC=n",
+                "CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=y",
+                "CONFIG_ESP32S3_KORVO2_V3_ADC_BUTTON_DIAGNOSTICS=y"
+            ]
+        },
+        {
+            "name": "esp32s3-korvo2-v3-hackers365-wifi",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_USE_SERVER_AEC=n",
+                "CONFIG_LOCAL_VAD_BARGE_IN=y",
+                "CONFIG_LOCAL_VAD_BARGE_IN_GUARD_MS=800",
+                "CONFIG_SR_VADN_WEBRTC=n",
+                "CONFIG_SR_VADN_VADNET1_MEDIUM=y",
+                "CONFIG_VOICE_LATENCY_METRICS=y",
+                "CONFIG_DUPLEX_PLAYBACK_CONTROL=y",
+                "CONFIG_LISTENER_FEEDBACK=y",
+                "CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4=y"
+            ]
+        },
+        {
+            "name": "esp32s3-korvo2-v3-hackers365-wifi-webrtc",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_USE_SERVER_AEC=n",
+                "CONFIG_LOCAL_VAD_BARGE_IN=y",
+                "CONFIG_LOCAL_VAD_BARGE_IN_GUARD_MS=800",
+                "CONFIG_SR_VADN_WEBRTC=n",
+                "CONFIG_SR_VADN_VADNET1_MEDIUM=y",
+                "CONFIG_VOICE_LATENCY_METRICS=y",
+                "CONFIG_DUPLEX_PLAYBACK_CONTROL=y",
+                "CONFIG_LISTENER_FEEDBACK=y",
+                "CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4=y",
+                "CONFIG_USE_WEBRTC=y",
+                "CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y",
+                "CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y",
+                "CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096"
+            ]
         }
     ]
 }

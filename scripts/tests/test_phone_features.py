@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import unittest
 
 
@@ -7,6 +8,30 @@ BOARD_DIR = ROOT / "main/boards/espressif/esp32-s3-korvo-2-v3.0"
 
 
 class StoryPhoneFeatureTests(unittest.TestCase):
+    def test_hackers365_webrtc_variant_preserves_full_duplex_features(self):
+        config = json.loads((BOARD_DIR / "config.json").read_text(encoding="utf-8"))
+        variant = next(
+            build
+            for build in config["builds"]
+            if build["name"] == "esp32s3-korvo2-v3-hackers365-wifi-webrtc"
+        )
+        options = set(variant["sdkconfig_append"])
+
+        for option in (
+            "CONFIG_USE_DEVICE_AEC=y",
+            "CONFIG_USE_SERVER_AEC=n",
+            "CONFIG_LOCAL_VAD_BARGE_IN=y",
+            "CONFIG_LOCAL_VAD_BARGE_IN_GUARD_MS=800",
+            "CONFIG_SR_VADN_WEBRTC=n",
+            "CONFIG_SR_VADN_VADNET1_MEDIUM=y",
+            "CONFIG_VOICE_LATENCY_METRICS=y",
+            "CONFIG_DUPLEX_PLAYBACK_CONTROL=y",
+            "CONFIG_LISTENER_FEEDBACK=y",
+            "CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4=y",
+            "CONFIG_USE_WEBRTC=y",
+        ):
+            self.assertIn(option, options)
+
     def test_korvo2_gpio4_hook_is_enabled_and_debounced(self):
         config = (BOARD_DIR / "config.json").read_text(encoding="utf-8")
         config_h = (BOARD_DIR / "config.h").read_text(encoding="utf-8")
@@ -44,6 +69,12 @@ class StoryPhoneFeatureTests(unittest.TestCase):
         self.assertIn("SendPhoneHangupRequest", protocol_h)
         self.assertIn(
             'cJSON_AddBoolToObject(features, "phone_hangup", true)', webrtc
+        )
+        self.assertIn(
+            'cJSON_AddBoolToObject(features, "playback_control_v1", true)', webrtc
+        )
+        self.assertIn(
+            'cJSON_AddBoolToObject(features, "listener_feedback_v1", true)', webrtc
         )
 
     def test_phone_ogg_assets_are_embedded_sources(self):
