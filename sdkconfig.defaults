@@ -42,6 +42,15 @@ CONFIG_UART_ISR_IN_IRAM=y
 # Fix ESP_SSL error
 CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
 
+# LiveKit's ESP WebRTC dependency is resolved for supported RTC targets even
+# when CONFIG_USE_WEBRTC is disabled for a particular board. Keep its DTLS-SRTP
+# compilation requirements available so existing ESP32-S3/P4 board builds do
+# not regress merely because the optional transport was added.
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
+CONFIG_MBEDTLS_X509_CREATE_C=y
+CONFIG_MBEDTLS_X509_CRT_WRITE_C=y
+
 # LVGL 9.2.2
 
 CONFIG_LV_OS_NONE=y

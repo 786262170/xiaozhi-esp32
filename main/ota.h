@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <esp_err.h>
 #include "board.h"
@@ -18,10 +19,12 @@ public:
     bool HasNewVersion() { return has_new_version_; }
     bool HasMqttConfig() { return has_mqtt_config_; }
     bool HasWebsocketConfig() { return has_websocket_config_; }
+    bool HasWebRTCConfig() { return has_webrtc_config_; }
     bool HasActivationCode() { return has_activation_code_; }
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
-    static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
+    static bool Upgrade(const std::string& firmware_url,
+                        std::function<void(int progress, size_t speed)> callback);
     void MarkCurrentVersionValid();
 
     const std::string& GetFirmwareVersion() const { return firmware_version_; }
@@ -30,6 +33,7 @@ public:
     const std::string& GetActivationMessage() const { return activation_message_; }
     const std::string& GetActivationCode() const { return activation_code_; }
     std::string GetCheckVersionUrl();
+    const std::vector<std::string>& GetTransportOrder() const { return transport_order_; }
 
 private:
     std::string activation_message_;
@@ -37,6 +41,7 @@ private:
     bool has_new_version_ = false;
     bool has_mqtt_config_ = false;
     bool has_websocket_config_ = false;
+    bool has_webrtc_config_ = false;
     bool has_server_time_ = false;
     bool has_activation_code_ = false;
     bool has_serial_number_ = false;
@@ -47,6 +52,7 @@ private:
     std::string activation_challenge_;
     std::string serial_number_;
     int activation_timeout_ms_ = 30000;
+    std::vector<std::string> transport_order_;
 
     std::function<void(int progress, size_t speed)> upgrade_callback_;
     std::vector<int> ParseVersion(const std::string& version);
@@ -55,4 +61,4 @@ private:
     std::unique_ptr<Http> SetupHttp();
 };
 
-#endif // _OTA_H
+#endif  // _OTA_H

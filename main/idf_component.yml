@@ -23,6 +23,12 @@ dependencies:
   78/esp-wifi-connect: ~3.2.2
   espressif/esp_audio_effects: ~1.3.0
   espressif/esp_audio_codec: ~2.5.0
+  livekit/livekit:
+    git: https://github.com/786262170/client-sdk-esp32.git
+    path: components/livekit
+    version: a26b376ab139c961db1303169ff9718698a17dca
+    rules:
+    - if: target in [esp32s3, esp32p4]
   78/esp-ml307: ~3.6.6
   78/uart-eth-modem:
     # 0.6.1 requires ESP-IDF >= 6.0.1. Keep 0.6.0 so the shared

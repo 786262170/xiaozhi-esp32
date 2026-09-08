@@ -4,17 +4,22 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "display.h"
+#include "fallback_protocol.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
+#if CONFIG_USE_WEBRTC
+#include "webrtc_protocol.h"
+#endif
 
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <algorithm>
 #include <cstring>
 
 #define TAG "Application"
@@ -499,14 +504,55 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
-    } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
+    auto transports = std::make_unique<FallbackProtocol>();
+    std::vector<std::string> added_transports;
+    auto add_transport = [&](const std::string& name) {
+        const std::string normalized_name = (name == "mqtt" || name == "udp") ? "mqtt_udp" : name;
+        if (std::find(added_transports.begin(), added_transports.end(), normalized_name) !=
+            added_transports.end()) {
+            return;
+        }
+#if CONFIG_USE_WEBRTC
+        if (normalized_name == "webrtc" && ota_->HasWebRTCConfig()) {
+            transports->AddCandidate(normalized_name,
+                                     std::make_unique<WebRTCProtocol>(audio_service_));
+            added_transports.push_back(normalized_name);
+            return;
+        }
+#endif
+        if (normalized_name == "websocket" && ota_->HasWebsocketConfig()) {
+            transports->AddCandidate(normalized_name, std::make_unique<WebsocketProtocol>());
+            added_transports.push_back(normalized_name);
+            return;
+        }
+        if (normalized_name == "mqtt_udp" && ota_->HasMqttConfig()) {
+            transports->AddCandidate(normalized_name, std::make_unique<MqttProtocol>());
+            added_transports.push_back(normalized_name);
+        }
+    };
+
+    for (const auto& transport : ota_->GetTransportOrder()) {
+        add_transport(transport);
     }
+    if (added_transports.empty()) {
+        // Preserve the legacy preference when the OTA server does not publish
+        // an explicit transport policy.
+        if (ota_->HasMqttConfig()) {
+            add_transport("mqtt_udp");
+        } else if (ota_->HasWebsocketConfig()) {
+            add_transport("websocket");
+        }
+#if CONFIG_USE_WEBRTC
+        else if (ota_->HasWebRTCConfig()) {
+            add_transport("webrtc");
+        }
+#endif
+    }
+    if (added_transports.empty()) {
+        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+        transports->AddCandidate("mqtt_udp", std::make_unique<MqttProtocol>());
+    }
+    protocol_ = std::move(transports);
 
     protocol_->OnConnected([this]() { DismissAlert(); });
 

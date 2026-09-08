@@ -925,6 +925,15 @@ config USE_SERVER_AEC
     help
         To work perperly, server-side AEC requires server support
 
+config USE_WEBRTC
+    bool "Enable LiveKit WebRTC transport"
+    default n
+    depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4) && SPIRAM
+    help
+        Enable the LiveKit ESP32 client transport. OTA may prefer WebRTC and
+        fall back to WebSocket or MQTT+UDP. The SDK is pinned because its
+        pre-1.0 API may change between releases.
+
 config USE_AUDIO_DEBUGGER
     bool "Enable Audio Debugger"
     default n
