@@ -9,7 +9,8 @@
                 "CONFIG_USE_WEBRTC=y",
                 "CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y",
                 "CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y",
-                "CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096"
+                "CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096",
+                "CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4=y"
             ]
         }
     ]

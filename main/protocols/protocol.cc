@@ -91,6 +91,12 @@ void Protocol::SendStopListening() {
     SendText(message);
 }
 
+bool Protocol::SendPhoneHangupRequest() {
+    std::string message = "{\"session_id\":\"" + session_id_ +
+                          "\",\"type\":\"phone_hangup\",\"state\":\"request\"}";
+    return SendText(message);
+}
+
 void Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";

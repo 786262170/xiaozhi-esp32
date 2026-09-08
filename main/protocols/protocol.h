@@ -64,6 +64,7 @@ public:
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);
+    virtual bool SendPhoneHangupRequest();
     virtual void SendMcpMessage(const std::string& message);
 
 protected:

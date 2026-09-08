@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -17,6 +18,7 @@
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
+#include "phone_call_controller.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -33,6 +35,8 @@
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
 #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+#define MAIN_EVENT_TOGGLE_PHONE_CALL    (1 << 14)
+#define MAIN_EVENT_PHONE_HOOK_CHANGED   (1 << 15)
 
 
 enum AecMode {
@@ -93,6 +97,11 @@ public:
      */
     void ToggleChatState();
 
+    // Phone-style controls use an explicit lifecycle instead of the generic
+    // chat-state toggle so a physical hook transition remains idempotent.
+    void TogglePhoneChatState();
+    void SetPhoneHookState(bool off_hook);
+
     /**
      * Start listening (event-based, thread-safe)
      * Sends MAIN_EVENT_START_LISTENING to be handled in Run()
@@ -142,10 +151,21 @@ private:
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
     bool has_server_time_ = false;
-    bool aborted_ = false;
+    std::atomic<bool> aborted_{false};
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    PhoneCallController phone_call_controller_;
+    std::atomic<bool> phone_hook_off_hook_{false};
+    std::atomic<bool> phone_connect_task_running_{false};
+    std::atomic<bool> phone_ringback_active_{false};
+    std::atomic<bool> phone_hangup_ready_{false};
+    std::atomic<bool> phone_hangup_sound_playing_{false};
+    uint32_t phone_connect_generation_ = 0;
+    ListeningMode phone_connect_mode_ = kListeningModeRealtime;
+    int64_t phone_call_started_us_ = 0;
+    int64_t phone_last_ringback_us_ = 0;
+    int64_t phone_hangup_requested_us_ = 0;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -153,6 +173,8 @@ private:
     // Event handlers
     void HandleStateChangedEvent();
     void HandleToggleChatEvent();
+    void HandleTogglePhoneCallEvent();
+    void HandlePhoneHookChangedEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();
     void HandleNetworkConnectedEvent();
@@ -160,6 +182,16 @@ private:
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
+    void BeginPhoneCall();
+    void StartPhoneConnectionTask(ListeningMode mode, uint32_t generation);
+    void RunPhoneConnectionTask();
+    void CompletePhoneConnection(ListeningMode mode, uint32_t generation, bool opened);
+    void HangUpPhoneCall();
+    void CompletePhoneHangup(const char* reason);
+    void FinalizePhoneHangup(const char* reason);
+    void FailPhoneCall(uint32_t generation, const char* reason);
+    void HandlePhoneCallClockTick();
+    bool StopPhoneRingbackForRemoteAudio();
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);
     void StartListeningAudio();

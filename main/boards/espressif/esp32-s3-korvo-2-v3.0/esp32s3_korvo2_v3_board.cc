@@ -6,8 +6,10 @@
 #include "config.h"
 #include "i2c_device.h"
 #include "assets/lang_config.h"
+#include "settings.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_io_expander_tca9554.h>
 #include <esp_lcd_ili9341.h>
@@ -17,7 +19,17 @@
 #include "power_manager.h"
 #include "power_save_timer.h"
 
+#include <atomic>
+
 #define TAG "esp32s3_korvo2_v3"
+
+namespace {
+constexpr int kStoryPhoneDefaultVolume = 80;
+constexpr const char* kStoryPhoneVolumeMigrationKey = "phone_vol80_v1";
+#if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
+constexpr int64_t kHandsetHookDebounceUs = 80 * 1000;
+#endif
+}  // namespace
 /* ADC Buttons */
 typedef enum {
     BSP_ADC_BUTTON_REC,
@@ -53,6 +65,11 @@ static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
 class Esp32S3Korvo2V3Board : public WifiBoard {
 private:
     Button boot_button_;
+#if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
+    Button handset_hook_button_{HANDSET_HOOK_GPIO};
+    std::atomic<bool> handset_hook_armed_{false};
+    esp_timer_handle_t handset_hook_debounce_timer_ = nullptr;
+#endif
     Button* adc_button_[BSP_ADC_BUTTON_NUM];
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     adc_oneshot_unit_handle_t bsp_adc_handle = NULL;
@@ -63,6 +80,17 @@ private:
     Esp32Camera* camera_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+
+    void InitializeStoryPhoneDefaultVolume() {
+        Settings settings("audio", true);
+        if (settings.GetBool(kStoryPhoneVolumeMigrationKey, false)) {
+            return;
+        }
+        settings.SetInt("output_volume", kStoryPhoneDefaultVolume);
+        settings.SetBool(kStoryPhoneVolumeMigrationKey, true);
+        ESP_LOGI(TAG, "Story phone output volume initialized to %d", kStoryPhoneDefaultVolume);
+    }
+
     void InitializePowerManager() {
         // PowerManager需要复用按钮的ADC句柄，所以在InitializeButtons之后调用
         // 传入按钮的ADC句柄指针，让PowerManager复用
@@ -186,6 +214,59 @@ private:
         GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
     }
 
+#if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
+    void ApplyDebouncedHandsetHookState() {
+        const bool off_hook = gpio_get_level(HANDSET_HOOK_GPIO) == 0;
+        if (!handset_hook_armed_.load()) {
+            if (off_hook) {
+                ESP_LOGW(TAG, "Ignoring boot-time off-hook; return handset to cradle to arm switch");
+                return;
+            }
+            handset_hook_armed_.store(true);
+            ESP_LOGI(TAG, "Handset hook armed after stable on-hook state");
+        }
+        ESP_LOGI(TAG, "Handset hook stable: %s", off_hook ? "off-hook" : "on-hook");
+        Application::GetInstance().SetPhoneHookState(off_hook);
+    }
+
+    void ScheduleHandsetHookDebounce() {
+        if (handset_hook_debounce_timer_ == nullptr) {
+            return;
+        }
+        const esp_err_t stop_result = esp_timer_stop(handset_hook_debounce_timer_);
+        if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop handset debounce timer: %s",
+                     esp_err_to_name(stop_result));
+        }
+        const esp_err_t start_result =
+            esp_timer_start_once(handset_hook_debounce_timer_, kHandsetHookDebounceUs);
+        if (start_result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start handset debounce timer: %s",
+                     esp_err_to_name(start_result));
+        }
+    }
+
+    void InitializeHandsetHookSwitch() {
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = [](void* arg) {
+            static_cast<Esp32S3Korvo2V3Board*>(arg)->ApplyDebouncedHandsetHookState();
+        };
+        timer_args.arg = this;
+        timer_args.dispatch_method = ESP_TIMER_TASK;
+        timer_args.name = "handset_hook";
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &handset_hook_debounce_timer_));
+
+        handset_hook_button_.OnPressDown([this]() { ScheduleHandsetHookDebounce(); });
+        handset_hook_button_.OnPressUp([this]() { ScheduleHandsetHookDebounce(); });
+
+        const bool initially_off_hook = gpio_get_level(HANDSET_HOOK_GPIO) == 0;
+        handset_hook_armed_.store(!initially_off_hook);
+        ESP_LOGI(TAG, "GPIO4 handset hook initialized: %s%s",
+                 initially_off_hook ? "off-hook" : "on-hook",
+                 initially_off_hook ? "; waiting for on-hook before arming" : "");
+    }
+#endif
+
     void InitializeButtons() {
          button_adc_config_t adc_cfg = {};
         adc_cfg.adc_channel = ADC_CHANNEL_4; // ADC1 channel 0 is GPIO5
@@ -255,8 +336,11 @@ private:
 
         auto rec_button = adc_button_[BSP_ADC_BUTTON_REC];
         rec_button->OnClick([this]() {
-             Application::GetInstance().ToggleChatState();
+             Application::GetInstance().TogglePhoneChatState();
         });
+#if CONFIG_ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
+        InitializeHandsetHookSwitch();
+#endif
         boot_button_.OnClick([this]() {});
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
@@ -393,6 +477,7 @@ private:
 public:
     Esp32S3Korvo2V3Board() : boot_button_(BOOT_BUTTON_GPIO) {
         ESP_LOGI(TAG, "Initializing esp32s3_korvo2_v3 Board");
+        InitializeStoryPhoneDefaultVolume();
         InitializePowerSaveTimer();
         InitializeI2c();
         I2cDetect();

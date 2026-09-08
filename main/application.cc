@@ -25,6 +25,22 @@
 
 #define TAG "Application"
 
+namespace {
+constexpr int64_t kPhoneCallTimeoutUs = 8 * 1000 * 1000;
+constexpr int64_t kPhoneHangupTimeoutUs = 4 * 1000 * 1000;
+constexpr int64_t kPhoneRingbackCadenceUs = 4900 * 1000;
+constexpr uint32_t kPhoneConnectTaskStackSize = 8192;
+// Keep network setup below the Opus codec task so local ringback playback is
+// not starved while the selected transport performs its handshake.
+constexpr UBaseType_t kPhoneConnectTaskPriority = 1;
+
+extern const char ogg_phone_dial_start[] asm("_binary_phone_dial_ogg_start");
+extern const char ogg_phone_dial_end[] asm("_binary_phone_dial_ogg_end");
+const std::string_view kPhoneCallingIntroSound{
+    static_cast<const char*>(ogg_phone_dial_start),
+    static_cast<size_t>(ogg_phone_dial_end - ogg_phone_dial_start)};
+}  // namespace
+
 Application::Application() {
     event_group_ = xEventGroupCreate();
 
@@ -190,15 +206,25 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_TOGGLE_PHONE_CALL |
+        MAIN_EVENT_PHONE_HOOK_CHANGED;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
-            SetDeviceState(kDeviceStateIdle);
-            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
-                  Lang::Sounds::OGG_EXCLAMATION);
+            auto call_state = phone_call_controller_.state();
+            if (call_state == PhoneCallState::kConnecting ||
+                call_state == PhoneCallState::kConnected) {
+                FailPhoneCall(phone_call_controller_.generation(), last_error_message_.c_str());
+            } else if (call_state == PhoneCallState::kHangingUp ||
+                       call_state == PhoneCallState::kFailed) {
+                ESP_LOGI(TAG, "Ignoring duplicate network error during phone cleanup");
+            } else {
+                SetDeviceState(kDeviceStateIdle);
+                Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
+                      Lang::Sounds::OGG_EXCLAMATION);
+            }
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
@@ -218,6 +244,14 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+            if (phone_call_controller_.state() == PhoneCallState::kHangingUp &&
+                audio_service_.IsPlaybackIdle()) {
+                if (phone_hangup_sound_playing_.load()) {
+                    FinalizePhoneHangup("local hang-up sound drained");
+                } else if (phone_hangup_ready_.load()) {
+                    CompletePhoneHangup("farewell playback drained");
+                }
+            }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
             if (pending_listening_start_ && GetDeviceState() == kDeviceStateListening &&
@@ -229,6 +263,14 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
             HandleToggleChatEvent();
+        }
+
+        if (bits & MAIN_EVENT_TOGGLE_PHONE_CALL) {
+            HandleTogglePhoneCallEvent();
+        }
+
+        if (bits & MAIN_EVENT_PHONE_HOOK_CHANGED) {
+            HandlePhoneHookChangedEvent();
         }
 
         if (bits & MAIN_EVENT_START_LISTENING) {
@@ -275,6 +317,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            HandlePhoneCallClockTick();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -318,10 +361,19 @@ void Application::HandleNetworkConnectedEvent() {
 void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
+    auto call_state = phone_call_controller_.state();
+    if (call_state == PhoneCallState::kConnecting ||
+        call_state == PhoneCallState::kConnected) {
+        FailPhoneCall(phone_call_controller_.generation(), "network disconnected");
+    }
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
-        ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
-        protocol_->CloseAudioChannel();
+        // A connection task may still be inside OpenAudioChannel. Its
+        // completion callback will close the stale transport safely.
+        if (!phone_connect_task_running_.load()) {
+            ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
+            protocol_->CloseAudioChannel();
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -573,7 +625,13 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        const bool phone_audio = phone_call_controller_.IsConnected();
+        if ((GetDeviceState() == kDeviceStateSpeaking || phone_audio) && !aborted_.load()) {
+            const bool first_phone_audio = phone_audio && StopPhoneRingbackForRemoteAudio();
+            if (first_phone_audio) {
+                ESP_LOGI(TAG, "Playing local phone pickup sound before remote greeting");
+                audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_CONNECT);
+            }
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -591,6 +649,21 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+            auto call_state = phone_call_controller_.state();
+            const bool server_hung_up = call_state == PhoneCallState::kConnecting ||
+                                        call_state == PhoneCallState::kConnected;
+            const bool hangup_interrupted = call_state == PhoneCallState::kHangingUp;
+            phone_ringback_active_.store(false);
+            phone_hangup_ready_.store(false);
+            phone_hangup_sound_playing_.store(false);
+            phone_hangup_requested_us_ = 0;
+            if (server_hung_up || hangup_interrupted) {
+                audio_service_.ResetDecoder();
+                audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_HANGUP);
+            }
+            if (!phone_connect_task_running_.load()) {
+                phone_call_controller_.Finish();
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -639,6 +712,27 @@ void Application::InitializeProtocol() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
+            }
+        } else if (strcmp(type->valuestring, "phone_hangup") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(state) && strcmp(state->valuestring, "ready") == 0) {
+                Schedule([this]() {
+                    auto call_state = phone_call_controller_.state();
+                    if (call_state == PhoneCallState::kConnected) {
+                        if (!phone_call_controller_.BeginHangUp()) {
+                            return;
+                        }
+                        phone_hangup_requested_us_ = esp_timer_get_time();
+                    } else if (call_state != PhoneCallState::kHangingUp) {
+                        return;
+                    }
+                    ESP_LOGI(TAG, "Phone farewell ready; waiting for playback drain");
+                    phone_hangup_sound_playing_.store(false);
+                    phone_hangup_ready_.store(true);
+                    if (audio_service_.IsPlaybackIdle()) {
+                        CompletePhoneHangup("farewell already drained");
+                    }
+                });
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
@@ -755,6 +849,281 @@ void Application::DismissAlert() {
 }
 
 void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
+
+void Application::TogglePhoneChatState() {
+    xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_PHONE_CALL);
+}
+
+void Application::SetPhoneHookState(bool off_hook) {
+    phone_hook_off_hook_.store(off_hook);
+    xEventGroupSetBits(event_group_, MAIN_EVENT_PHONE_HOOK_CHANGED);
+}
+
+void Application::HandleTogglePhoneCallEvent() {
+    switch (phone_call_controller_.state()) {
+        case PhoneCallState::kIdle:
+            BeginPhoneCall();
+            break;
+        case PhoneCallState::kConnecting:
+        case PhoneCallState::kConnected:
+            HangUpPhoneCall();
+            break;
+        case PhoneCallState::kHangingUp:
+        case PhoneCallState::kFailed:
+            ESP_LOGI(TAG, "Phone call cleanup is still in progress");
+            break;
+    }
+}
+
+void Application::HandlePhoneHookChangedEvent() {
+    const bool off_hook = phone_hook_off_hook_.load();
+    switch (phone_call_controller_.ActionForHookState(off_hook)) {
+        case PhoneHookAction::kBegin:
+            ESP_LOGI(TAG, "Handset lifted; starting phone call");
+            BeginPhoneCall();
+            break;
+        case PhoneHookAction::kHangUp:
+            ESP_LOGI(TAG, "Handset returned to cradle; hanging up phone call");
+            HangUpPhoneCall();
+            break;
+        case PhoneHookAction::kNone:
+            ESP_LOGI(TAG, "Handset state already applied: %s", off_hook ? "off-hook" : "on-hook");
+            break;
+    }
+}
+
+void Application::BeginPhoneCall() {
+    if (!protocol_) {
+        ESP_LOGE(TAG, "Protocol not initialized");
+        audio_service_.ResetDecoder();
+        audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_FAILED);
+        return;
+    }
+    if (phone_connect_task_running_.load()) {
+        ESP_LOGW(TAG, "Previous phone connection task is still running");
+        return;
+    }
+
+    const uint32_t generation = phone_call_controller_.Begin();
+    if (generation == 0) {
+        return;
+    }
+
+    phone_call_started_us_ = esp_timer_get_time();
+    phone_last_ringback_us_ = phone_call_started_us_;
+    phone_ringback_active_.store(true);
+    phone_hangup_ready_.store(false);
+    phone_hangup_sound_playing_.store(false);
+    audio_service_.ResetDecoder();
+
+    const ListeningMode mode = GetDefaultListeningMode();
+    SetDeviceState(kDeviceStateConnecting);
+    // Start transport setup before enqueueing the local intro so connection
+    // latency is hidden behind the first ring.
+    StartPhoneConnectionTask(mode, generation);
+    if (!phone_call_controller_.IsConnecting(generation)) {
+        return;
+    }
+    audio_service_.PlaySound(kPhoneCallingIntroSound);
+}
+
+void Application::StartPhoneConnectionTask(ListeningMode mode, uint32_t generation) {
+    phone_connect_mode_ = mode;
+    phone_connect_generation_ = generation;
+    phone_connect_task_running_.store(true);
+
+    BaseType_t result = xTaskCreate(
+        [](void* arg) {
+            auto* app = static_cast<Application*>(arg);
+            app->RunPhoneConnectionTask();
+            vTaskDelete(nullptr);
+        },
+        "phone_connect", kPhoneConnectTaskStackSize, this, kPhoneConnectTaskPriority, nullptr);
+    if (result != pdPASS) {
+        phone_connect_task_running_.store(false);
+        FailPhoneCall(generation, "failed to create connection task");
+    }
+}
+
+void Application::RunPhoneConnectionTask() {
+    const uint32_t generation = phone_connect_generation_;
+    const ListeningMode mode = phone_connect_mode_;
+    bool opened = false;
+
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (protocol_) {
+        opened = protocol_->IsAudioChannelOpened() || protocol_->OpenAudioChannel();
+    }
+
+    phone_connect_task_running_.store(false);
+    Schedule([this, mode, generation, opened]() {
+        CompletePhoneConnection(mode, generation, opened);
+    });
+}
+
+void Application::CompletePhoneConnection(ListeningMode mode, uint32_t generation, bool opened) {
+    if (!phone_call_controller_.IsConnecting(generation)) {
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+        }
+        phone_call_controller_.Finish();
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+
+    if (!opened) {
+        FailPhoneCall(generation, "audio channel open failed");
+        return;
+    }
+
+    if (!phone_call_controller_.MarkConnected(generation)) {
+        protocol_->CloseAudioChannel();
+        phone_call_controller_.Finish();
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Phone audio channel connected; waiting for first remote audio frame");
+    SetListeningMode(mode);
+}
+
+void Application::HangUpPhoneCall() {
+    const auto previous_state = phone_call_controller_.state();
+    if (!phone_call_controller_.BeginHangUp()) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Phone hang-up requested");
+    phone_ringback_active_.store(false);
+    phone_hangup_ready_.store(false);
+    phone_hangup_sound_playing_.store(false);
+    phone_hangup_requested_us_ = esp_timer_get_time();
+    audio_service_.ResetDecoder();
+
+    if (previous_state == PhoneCallState::kConnecting || !protocol_ ||
+        !protocol_->IsAudioChannelOpened()) {
+        CompletePhoneHangup("call was not connected");
+        return;
+    }
+
+    protocol_->SendAbortSpeaking(kAbortReasonNone);
+    protocol_->SendStopListening();
+    SetDeviceState(kDeviceStateSpeaking);
+    if (!protocol_->SendPhoneHangupRequest()) {
+        ESP_LOGW(TAG, "Failed to request coordinated phone hang-up; using local fallback");
+        CompletePhoneHangup("hangup request send failed");
+    }
+}
+
+void Application::CompletePhoneHangup(const char* reason) {
+    if (phone_call_controller_.state() != PhoneCallState::kHangingUp ||
+        phone_hangup_sound_playing_.load()) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playing local phone hang-up sound: %s",
+             reason != nullptr ? reason : "unknown");
+    phone_ringback_active_.store(false);
+    phone_hangup_ready_.store(false);
+    phone_hangup_sound_playing_.store(true);
+    phone_hangup_requested_us_ = esp_timer_get_time();
+    audio_service_.ResetDecoder();
+    audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_HANGUP);
+
+    if (audio_service_.IsPlaybackIdle()) {
+        FinalizePhoneHangup("local hang-up sound unavailable");
+    }
+}
+
+void Application::FinalizePhoneHangup(const char* reason) {
+    if (phone_call_controller_.state() != PhoneCallState::kHangingUp) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Finalizing phone hang-up: %s", reason != nullptr ? reason : "unknown");
+    phone_ringback_active_.store(false);
+    phone_hangup_ready_.store(false);
+    phone_hangup_sound_playing_.store(false);
+    phone_hangup_requested_us_ = 0;
+
+    // Mark idle first so the transport close callback does not enqueue a
+    // duplicate local hang-up sound.
+    phone_call_controller_.Finish();
+    if (!phone_connect_task_running_.load() && protocol_) {
+        protocol_->CloseAudioChannel();
+    }
+    SetDeviceState(kDeviceStateIdle);
+}
+
+void Application::FailPhoneCall(uint32_t generation, const char* reason) {
+    if (!phone_call_controller_.Fail(generation)) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Phone call failed: %s", reason != nullptr ? reason : "unknown");
+    phone_ringback_active_.store(false);
+    phone_hangup_ready_.store(false);
+    phone_hangup_sound_playing_.store(false);
+    audio_service_.ResetDecoder();
+    if (!phone_connect_task_running_.load() && protocol_) {
+        protocol_->CloseAudioChannel();
+    }
+    SetDeviceState(kDeviceStateIdle);
+    audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_FAILED);
+    if (!phone_connect_task_running_.load()) {
+        phone_call_controller_.Finish();
+    }
+}
+
+void Application::HandlePhoneCallClockTick() {
+    auto state = phone_call_controller_.state();
+    if (state == PhoneCallState::kHangingUp) {
+        if (phone_hangup_sound_playing_.load()) {
+            if (audio_service_.IsPlaybackIdle()) {
+                FinalizePhoneHangup("local hang-up sound drained on clock tick");
+            } else if (phone_hangup_requested_us_ > 0 &&
+                       esp_timer_get_time() - phone_hangup_requested_us_ >=
+                           kPhoneHangupTimeoutUs) {
+                ESP_LOGW(TAG, "Local phone hang-up sound timeout; closing channel");
+                audio_service_.ResetDecoder();
+                FinalizePhoneHangup("local hang-up sound timeout");
+            }
+        } else if (phone_hangup_ready_.load() && audio_service_.IsPlaybackIdle()) {
+            CompletePhoneHangup("farewell drained on clock tick");
+        } else if (phone_hangup_requested_us_ > 0 &&
+                   esp_timer_get_time() - phone_hangup_requested_us_ >= kPhoneHangupTimeoutUs) {
+            ESP_LOGW(TAG, "Phone farewell timeout; playing local hang-up sound");
+            CompletePhoneHangup("farewell timeout");
+        }
+        return;
+    }
+
+    if (!phone_ringback_active_.load() ||
+        (state != PhoneCallState::kConnecting && state != PhoneCallState::kConnected)) {
+        return;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if (now - phone_call_started_us_ >= kPhoneCallTimeoutUs) {
+        FailPhoneCall(phone_call_controller_.generation(), "connection greeting timeout");
+        return;
+    }
+    if (now - phone_last_ringback_us_ >= kPhoneRingbackCadenceUs &&
+        audio_service_.IsPlaybackIdle()) {
+        phone_last_ringback_us_ = now;
+        audio_service_.PlaySound(Lang::Sounds::OGG_PHONE_RINGBACK);
+    }
+}
+
+bool Application::StopPhoneRingbackForRemoteAudio() {
+    if (!phone_ringback_active_.exchange(false)) {
+        return false;
+    }
+    ESP_LOGI(TAG, "First remote phone audio received; stopping local ringback");
+    audio_service_.ResetDecoder();
+    return true;
+}
 
 void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
 

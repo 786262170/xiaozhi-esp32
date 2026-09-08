@@ -298,6 +298,7 @@ bool WebRTCProtocol::SendClientHello() {
     cJSON_AddNumberToObject(root, "version", 1);
     cJSON* features = cJSON_CreateObject();
     cJSON_AddBoolToObject(features, "mcp", true);
+    cJSON_AddBoolToObject(features, "phone_hangup", true);
 #if CONFIG_USE_DEVICE_AEC
     cJSON_AddBoolToObject(features, "aec", true);
 #endif

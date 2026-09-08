@@ -750,6 +750,15 @@ choice DISPLAY_ESP32S3_KORVO2_V3
         bool "ILI9341 240*320"
 endchoice
 
+config ESP32S3_KORVO2_V3_HANDSET_HOOK_GPIO4
+    bool "Use GPIO4 as an active-low handset hook switch"
+    depends on BOARD_TYPE_ESP32_S3_KORVO_2_V3
+    default n
+    help
+        Reuse the TF-card SD_DATA0 signal on GPIO4 as a handset hook input.
+        Leave the TF card slot empty when this option is enabled. The input
+        uses the internal pull-up: low means off-hook and high means on-hook.
+
 choice DISPLAY_ESP32S3_CAM_XXXX
     depends on BOARD_TYPE_WAVESHARE_ESP32_S3_CAM_XXXX
     prompt "ESP32S3_CAM LCD Type"
